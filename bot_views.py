@@ -1,13 +1,8 @@
 import discord
 from discord.ext import commands
+from datetime import timezone
 
-from config import (
-    REVIEW_CHANNEL_ID,
-    PAID_ROLE_ID,
-    ADMIN_ROLE_IDS,
-    MONTH_PRICE_LABEL,
-    JST,
-)
+from config import JST
 from storage_sqlite import (
     has_pending_request,
     create_request,
@@ -19,8 +14,8 @@ from storage_sqlite import (
 )
 
 
-def is_admin_member(member: discord.Member) -> bool:
-    return any(r.id in ADMIN_ROLE_IDS for r in member.roles)
+def is_admin_member(member: discord.Member, admin_role_ids: set[int]) -> bool:
+    return any(r.id in admin_role_ids for r in member.roles)
 
 
 class PayModal(discord.ui.Modal, title="付款信息提交"):
@@ -56,7 +51,8 @@ class PayModal(discord.ui.Modal, title="付款信息提交"):
             note=str(self.note.value).strip() if self.note.value else None,
         )
 
-        review_ch = self.bot.get_channel(REVIEW_CHANNEL_ID)
+        review_channel_id = int(self.bot.kcfg.get("review_channel_id", 0))
+        review_ch = self.bot.get_channel(review_channel_id)
         if review_ch is None:
             await interaction.response.send_message(
                 "已收到，但审核频道配置不正确（机器人找不到审核频道）。请联系管理员。", ephemeral=True
@@ -75,7 +71,6 @@ class PayModal(discord.ui.Modal, title="付款信息提交"):
         embed.set_footer(text="点击按钮进行确认/拒绝")
 
         await review_ch.send(embed=embed, view=ReviewView(self.bot, request_id))
-
         await interaction.response.send_message("已提交审核，请等待管理员确认。", ephemeral=True)
 
 
@@ -100,9 +95,10 @@ class PayPanelView(discord.ui.View):
             )
             return
 
+        price = self.bot.kcfg.get("month_price_label", "XXX円")
         exp = expires_at or "未设置"
         msg = (
-            f"**1个月费用：{MONTH_PRICE_LABEL}**\n\n"
+            f"**1个月费用：{price}**\n\n"
             f"请用下面链接付款：\n{url}\n\n"
             f"有效期：{exp}\n"
             f"（记录时间：{created_at}）\n\n"
@@ -128,13 +124,13 @@ class ReviewView(discord.ui.View):
         self.bot = bot
         self.request_id = request_id
 
-        # 固定 custom_id（带 request_id）以便重启后仍可用
         self.approve_button.custom_id = f"payflow:approve:{request_id}"
         self.reject_button.custom_id = f"payflow:reject:{request_id}"
 
     @discord.ui.button(label="确认通过", style=discord.ButtonStyle.success)
     async def approve_button(self, interaction: discord.Interaction, button: discord.ui.Button):
-        if not isinstance(interaction.user, discord.Member) or not is_admin_member(interaction.user):
+        admin_role_ids: set[int] = self.bot.kcfg.get("admin_role_ids", set())
+        if not isinstance(interaction.user, discord.Member) or not is_admin_member(interaction.user, admin_role_ids):
             await interaction.response.send_message("你没有审核权限。", ephemeral=True)
             return
 
@@ -156,25 +152,22 @@ class ReviewView(discord.ui.View):
             await interaction.response.send_message("找不到该用户（可能已退群）。", ephemeral=True)
             return
 
-        paid_role = guild.get_role(PAID_ROLE_ID)
+        paid_role_id = int(self.bot.kcfg.get("paid_role_id", 0))
+        paid_role = guild.get_role(paid_role_id)
         if paid_role is None:
             await interaction.response.send_message("Paid 角色配置不正确（找不到角色）。", ephemeral=True)
             return
 
-        # 计算有效期
         start_at = discord.utils.utcnow().replace(tzinfo=timezone.utc).astimezone(JST)
         end_at = month_end_after_one_month(start_at)
 
-        # 赋角色
         await member.add_roles(paid_role, reason="Payment approved")
 
-        # 更新DB（防并发：只允许从 PENDING -> APPROVED）
         ok = approve_request(self.request_id, interaction.user.id, start_at, end_at)
         if not ok:
             await interaction.response.send_message("DB 更新失败（可能已被其他管理员处理）。", ephemeral=True)
             return
 
-        # 禁用按钮，避免重复点
         for child in self.children:
             if isinstance(child, discord.ui.Button):
                 child.disabled = True
@@ -186,7 +179,6 @@ class ReviewView(discord.ui.View):
             ephemeral=True,
         )
 
-        # 可选 DM
         try:
             await member.send(
                 f"✅ 你的付费已通过审核。\n"
@@ -197,7 +189,8 @@ class ReviewView(discord.ui.View):
 
     @discord.ui.button(label="拒绝", style=discord.ButtonStyle.danger)
     async def reject_button(self, interaction: discord.Interaction, button: discord.ui.Button):
-        if not isinstance(interaction.user, discord.Member) or not is_admin_member(interaction.user):
+        admin_role_ids: set[int] = self.bot.kcfg.get("admin_role_ids", set())
+        if not isinstance(interaction.user, discord.Member) or not is_admin_member(interaction.user, admin_role_ids):
             await interaction.response.send_message("你没有审核权限。", ephemeral=True)
             return
 
@@ -221,7 +214,6 @@ class ReviewView(discord.ui.View):
 
         await interaction.response.send_message("已拒绝该申请。", ephemeral=True)
 
-        # 可选通知用户
         guild = interaction.guild
         if guild:
             member = guild.get_member(int(row["user_id"]))
