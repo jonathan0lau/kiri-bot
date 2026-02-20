@@ -1,8 +1,8 @@
 import sqlite3
 import uuid
-from datetime import datetime, timedelta, timezone
 import calendar
-from typing import Optional, Tuple, List, Dict
+from datetime import datetime, timedelta
+from typing import Optional, Tuple, Dict, Any, List
 
 from config import DB_PATH, JST
 
@@ -35,7 +35,6 @@ def init_db():
         )
         """
     )
-
     cur.execute("CREATE INDEX IF NOT EXISTS idx_requests_user_status ON requests(user_id, status)")
     cur.execute("CREATE INDEX IF NOT EXISTS idx_requests_status_end ON requests(status, end_at)")
 
@@ -54,8 +53,125 @@ def init_db():
     )
     cur.execute("CREATE INDEX IF NOT EXISTS idx_paypay_active ON paypay_links(is_active)")
 
+    # ===== Kvs_M 配置中心 =====
+    cur.execute(
+        """
+        CREATE TABLE IF NOT EXISTS Kvs_M (
+            key1  TEXT NOT NULL,
+            key2  TEXT NOT NULL,
+            key3  TEXT NOT NULL,
+            value TEXT NOT NULL,
+            note  TEXT,
+            PRIMARY KEY (key1, key2, key3)
+        )
+        """
+    )
+
     conn.commit()
     conn.close()
+
+    ensure_default_kvs()
+
+
+# ===== Kvs_M =====
+def kv_upsert(key1: str, key2: str, key3: str, value: str, note: Optional[str] = None):
+    """
+    存在就更新，不存在就插入（SQLite upsert）
+    """
+    conn = _conn()
+    cur = conn.cursor()
+    cur.execute(
+        """
+        INSERT INTO Kvs_M(key1,key2,key3,value,note)
+        VALUES(?,?,?,?,?)
+        ON CONFLICT(key1,key2,key3)
+        DO UPDATE SET value=excluded.value, note=excluded.note
+        """,
+        (key1, key2, key3, value, note),
+    )
+    conn.commit()
+    conn.close()
+
+
+def kv_get(key1: str, key2: str, key3: str) -> Optional[str]:
+    conn = _conn()
+    cur = conn.cursor()
+    cur.execute(
+        "SELECT value FROM Kvs_M WHERE key1=? AND key2=? AND key3=?",
+        (key1, key2, key3),
+    )
+    row = cur.fetchone()
+    conn.close()
+    return row["value"] if row else None
+
+
+def kv_set_if_absent(key1: str, key2: str, key3: str, value: str, note: Optional[str] = None):
+    conn = _conn()
+    cur = conn.cursor()
+    cur.execute(
+        """
+        INSERT OR IGNORE INTO Kvs_M(key1,key2,key3,value,note)
+        VALUES(?,?,?,?,?)
+        """,
+        (key1, key2, key3, value, note),
+    )
+    conn.commit()
+    conn.close()
+
+
+def ensure_default_kvs():
+    """
+    只在不存在时写入默认值，避免覆盖你已有配置。
+    key1: 大分类（auth/billing/security/discord/reminder 等）
+    key2: 中类（channel/role/user/global 等）
+    key3: 小类（具体参数名）
+    """
+    # Discord 资源
+    kv_set_if_absent("discord", "channel", "review_id", "0", "审核单输出频道ID")
+    kv_set_if_absent("discord", "channel", "remind_id", "0", "到期提醒输出频道ID")
+    kv_set_if_absent("discord", "role", "paid_id", "0", "付费会员角色ID")
+
+    # 权限
+    kv_set_if_absent("auth", "role", "admin_role_ids", "", "机器人管理员角色ID，逗号分隔")
+
+    # 付费显示
+    kv_set_if_absent("billing", "global", "month_price_label", "XXX円", "月费显示用（不参与实际支付）")
+
+    # 提醒策略
+    kv_set_if_absent("reminder", "global", "expiry_days", "5", "提前几天提醒到期")
+    kv_set_if_absent("reminder", "global", "scan_hours", "12", "扫描间隔（小时）")
+
+
+def load_runtime_settings() -> Dict[str, Any]:
+    """
+    从 Kvs_M 读出运行时配置，返回 dict（bot.kcfg 使用）
+    """
+    def as_int(v: Optional[str], default: int) -> int:
+        try:
+            return int(v) if v is not None and str(v).strip() != "" else default
+        except Exception:
+            return default
+
+    def as_csv_int_set(v: Optional[str]) -> set[int]:
+        if not v:
+            return set()
+        out: set[int] = set()
+        for part in str(v).split(","):
+            part = part.strip()
+            if part.isdigit():
+                out.add(int(part))
+        return out
+
+    cfg = {
+        "review_channel_id": as_int(kv_get("discord", "channel", "review_id"), 0),
+        "remind_channel_id": as_int(kv_get("discord", "channel", "remind_id"), 0),
+        "paid_role_id": as_int(kv_get("discord", "role", "paid_id"), 0),
+        "admin_role_ids": as_csv_int_set(kv_get("auth", "role", "admin_role_ids")),
+        "month_price_label": kv_get("billing", "global", "month_price_label") or "XXX円",
+        "expiry_days": as_int(kv_get("reminder", "global", "expiry_days"), 5),
+        "scan_hours": as_int(kv_get("reminder", "global", "scan_hours"), 12),
+    }
+    return cfg
 
 
 # ===== 业务规则：一个月后的月末 23:59:59（JST） =====
@@ -178,19 +294,13 @@ def list_expiring_soon(days: int = 5):
 
 # ===== PayPay links =====
 def set_paypay_link(url: str, created_by: Optional[int], expires_at: Optional[str]) -> str:
-    """
-    把现有 active 置为 inactive，然后插入新 active。
-    expires_at：建议传 ISO 字符串，或 None
-    """
     link_id = str(uuid.uuid4())
     now = datetime.now(JST).isoformat()
 
     conn = _conn()
     cur = conn.cursor()
 
-    # deactivate all
     cur.execute("UPDATE paypay_links SET is_active=0 WHERE is_active=1")
-
     cur.execute(
         """
         INSERT INTO paypay_links(link_id, url, created_at, created_by, expires_at, is_active)
@@ -205,9 +315,6 @@ def set_paypay_link(url: str, created_by: Optional[int], expires_at: Optional[st
 
 
 def get_active_paypay_link() -> Tuple[Optional[str], Optional[str], Optional[str]]:
-    """
-    return (url, expires_at, created_at)
-    """
     conn = _conn()
     cur = conn.cursor()
     cur.execute(

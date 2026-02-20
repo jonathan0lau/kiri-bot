@@ -1,48 +1,100 @@
 import discord
 from discord.ext import commands, tasks
+from datetime import datetime, timedelta
 
-from config import (
-    DISCORD_TOKEN,
-    REVIEW_CHANNEL_ID,
-    REMIND_CHANNEL_ID,
-    ADMIN_ROLE_IDS,
-    EXPIRY_REMIND_DAYS,
-    REMIND_SCAN_EVERY_HOURS,
+from config import DISCORD_TOKEN, KVS_ADMIN_KEY, JST
+from storage_sqlite import (
+    init_db,
+    load_runtime_settings,
+    list_expiring_soon,
+    set_paypay_link,
+    get_active_paypay_link,
+    kv_upsert,
+    kv_get,
 )
-from storage_sqlite import init_db, list_expiring_soon, set_paypay_link, get_active_paypay_link
 from bot_views import PayPanelView
 
 
 intents = discord.Intents.default()
 intents.guilds = True
-intents.members = True  # 给人加角色需要
-intents.message_content = True  # 你用 ! 命令就需要；不用前缀命令可关
+intents.members = True
+intents.message_content = True  # 你使用 ! 命令就必须开
 
 bot = commands.Bot(command_prefix="!", intents=intents)
 
+# 记忆提醒扫描节奏（动态按 Kvs_M 的 scan_hours）
+bot._next_remind_at = None
 
-def is_admin_member(member: discord.Member) -> bool:
-    return any(r.id in ADMIN_ROLE_IDS for r in member.roles)
+
+def reload_kcfg():
+    bot.kcfg = load_runtime_settings()
+
+
+def is_admin_member(member: discord.Member, admin_role_ids: set[int]) -> bool:
+    return any(r.id in admin_role_ids for r in member.roles)
+
+
+def is_dm(ctx: commands.Context) -> bool:
+    return ctx.guild is None
 
 
 @bot.event
 async def on_ready():
     init_db()
+    reload_kcfg()
 
-    # 注册 persistent view：重启后旧面板按钮仍可点
     bot.add_view(PayPanelView(bot))
 
     print(f"READY: {bot.user} ({bot.user.id})")
     print("GUILDS:", [g.name for g in bot.guilds])
+    print("KCFG:", bot.kcfg)
 
-    if not expiring_reminder.is_running():
-        expiring_reminder.start()
+    if not expiring_reminder_tick.is_running():
+        expiring_reminder_tick.start()
 
 
-# ===== 管理员命令：发付款面板（发完请手动 Pin）=====
+# ====== DM-only：Kvs 更新命令（你说的引数格式） ======
+# 用法（私信 bot）：
+# !kvs <password> <key1> <key2> <key3> <value> [note...]
+@bot.command(name="kvs")
+async def kvs_cmd(
+    ctx: commands.Context,
+    password: str,
+    key1: str,
+    key2: str,
+    key3: str,
+    value: str,
+    *,
+    note: str = None
+):
+    if not is_dm(ctx):
+        await ctx.reply("❌ 这个命令只能私信我使用（DM）。")
+        return
+
+    if not KVS_ADMIN_KEY or password != KVS_ADMIN_KEY:
+        await ctx.reply("❌ password 不正确。")
+        return
+
+    kv_upsert(key1, key2, key3, value, note)
+    reload_kcfg()
+    await ctx.reply(f"✅ upsert 完成：({key1},{key2},{key3}) = {value}" + (f"\nnote: {note}" if note else ""))
+
+
+@bot.command(name="kvsget")
+async def kvsget_cmd(ctx: commands.Context, key1: str, key2: str, key3: str):
+    if not is_dm(ctx):
+        await ctx.reply("❌ 这个命令只能私信我使用（DM）。")
+        return
+    v = kv_get(key1, key2, key3)
+    await ctx.reply(f"{key1}/{key2}/{key3} = {v}")
+
+
+# ====== 服务器内命令：需要管理员角色（来自 Kvs_M） ======
 @bot.command(name="paypanel")
 async def paypanel(ctx: commands.Context):
-    if not isinstance(ctx.author, discord.Member) or not is_admin_member(ctx.author):
+    reload_kcfg()
+    admin_role_ids: set[int] = bot.kcfg.get("admin_role_ids", set())
+    if not isinstance(ctx.author, discord.Member) or not is_admin_member(ctx.author, admin_role_ids):
         await ctx.reply("你没有权限执行该命令。")
         return
 
@@ -55,12 +107,11 @@ async def paypanel(ctx: commands.Context):
     await ctx.send(msg, view=PayPanelView(bot))
 
 
-# ===== 管理员命令：设置 PayPay 链接 =====
-# 用法：!setpaypay <url> [expires]
-# expires 可随便写一段字符串（比如 2026-02-26 17:08），存 DB 仅用于展示
 @bot.command(name="setpaypay")
 async def setpaypay(ctx: commands.Context, url: str, *, expires: str = None):
-    if not isinstance(ctx.author, discord.Member) or not is_admin_member(ctx.author):
+    reload_kcfg()
+    admin_role_ids: set[int] = bot.kcfg.get("admin_role_ids", set())
+    if not isinstance(ctx.author, discord.Member) or not is_admin_member(ctx.author, admin_role_ids):
         await ctx.reply("你没有权限执行该命令。")
         return
 
@@ -79,27 +130,41 @@ async def getpaypay(ctx: commands.Context):
     )
 
 
-# ===== 到期提醒 =====
-@tasks.loop(hours=REMIND_SCAN_EVERY_HOURS)
-async def expiring_reminder():
-    rows = list_expiring_soon(days=EXPIRY_REMIND_DAYS)
+# ====== 到期提醒：每小时 tick，一旦到达 next_remind_at 就执行一次 ======
+@tasks.loop(minutes=60)
+async def expiring_reminder_tick():
+    reload_kcfg()
+
+    remind_channel_id = int(bot.kcfg.get("remind_channel_id", 0))
+    if remind_channel_id == 0:
+        return
+
+    # 计算下一次执行时间（动态按 scan_hours）
+    scan_hours = int(bot.kcfg.get("scan_hours", 12))
+    now = datetime.now(JST)
+
+    if bot._next_remind_at is None:
+        bot._next_remind_at = now  # 启动后立刻跑一次
+    if now < bot._next_remind_at:
+        return
+
+    # 执行本轮提醒
+    days = int(bot.kcfg.get("expiry_days", 5))
+    rows = list_expiring_soon(days=days)
     if not rows:
+        bot._next_remind_at = now + timedelta(hours=scan_hours)
         return
 
-    ch = bot.get_channel(REMIND_CHANNEL_ID)
+    ch = bot.get_channel(remind_channel_id)
     if ch is None:
+        bot._next_remind_at = now + timedelta(hours=scan_hours)
         return
 
-    lines = []
-    for r in rows:
-        lines.append(f"- <@{r['user_id']}> 将在 {r['end_at']} 到期（JST）")
+    lines = [f"- <@{r['user_id']}> 将在 {r['end_at']} 到期（JST）" for r in rows]
+    await ch.send(f"⚠️ 付费会员即将到期（{days}天内）：\n" + "\n".join(lines))
 
-    await ch.send(f"⚠️ 付费会员即将到期（{EXPIRY_REMIND_DAYS}天内）：\n" + "\n".join(lines))
+    bot._next_remind_at = now + timedelta(hours=scan_hours)
 
 
 if __name__ == "__main__":
-    if REVIEW_CHANNEL_ID == 0:
-        print("ERROR: REVIEW_CHANNEL_ID 未配置")
-    if not ADMIN_ROLE_IDS:
-        print("WARN: ADMIN_ROLE_IDS 未配置（你将无法执行管理命令/审核）")
     bot.run(DISCORD_TOKEN)
