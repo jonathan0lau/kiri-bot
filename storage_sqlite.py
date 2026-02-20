@@ -53,7 +53,11 @@ def init_db():
     )
     cur.execute("CREATE INDEX IF NOT EXISTS idx_paypay_active ON paypay_links(is_active)")
 
+<<<<<<< HEAD
     # ===== Kvs_M 配置中心 =====
+=======
+    # ====== Kvs_M：你的配置中心 ======
+>>>>>>> a6a1f270d9087c73e16344b2a3b358992e2f512f
     cur.execute(
         """
         CREATE TABLE IF NOT EXISTS Kvs_M (
@@ -70,6 +74,7 @@ def init_db():
     conn.commit()
     conn.close()
 
+<<<<<<< HEAD
     ensure_default_kvs()
 
 
@@ -78,6 +83,29 @@ def kv_upsert(key1: str, key2: str, key3: str, value: str, note: Optional[str] =
     """
     存在就更新，不存在就插入（SQLite upsert）
     """
+=======
+    # 初始化默认配置（只在不存在时写入）
+    ensure_default_kvs()
+
+
+# ===== Kvs_M helpers =====
+KVS_KEY1 = "kiri_bot"
+
+
+def kv_get(key2: str, key3: str) -> Optional[str]:
+    conn = _conn()
+    cur = conn.cursor()
+    cur.execute(
+        "SELECT value FROM Kvs_M WHERE key1=? AND key2=? AND key3=?",
+        (KVS_KEY1, key2, key3),
+    )
+    row = cur.fetchone()
+    conn.close()
+    return row["value"] if row else None
+
+
+def kv_set(key2: str, key3: str, value: str, note: Optional[str] = None):
+>>>>>>> a6a1f270d9087c73e16344b2a3b358992e2f512f
     conn = _conn()
     cur = conn.cursor()
     cur.execute(
@@ -87,12 +115,17 @@ def kv_upsert(key1: str, key2: str, key3: str, value: str, note: Optional[str] =
         ON CONFLICT(key1,key2,key3)
         DO UPDATE SET value=excluded.value, note=excluded.note
         """,
+<<<<<<< HEAD
         (key1, key2, key3, value, note),
+=======
+        (KVS_KEY1, key2, key3, value, note),
+>>>>>>> a6a1f270d9087c73e16344b2a3b358992e2f512f
     )
     conn.commit()
     conn.close()
 
 
+<<<<<<< HEAD
 def kv_get(key1: str, key2: str, key3: str) -> Optional[str]:
     conn = _conn()
     cur = conn.cursor()
@@ -106,6 +139,9 @@ def kv_get(key1: str, key2: str, key3: str) -> Optional[str]:
 
 
 def kv_set_if_absent(key1: str, key2: str, key3: str, value: str, note: Optional[str] = None):
+=======
+def kv_set_if_absent(key2: str, key3: str, value: str, note: Optional[str] = None):
+>>>>>>> a6a1f270d9087c73e16344b2a3b358992e2f512f
     conn = _conn()
     cur = conn.cursor()
     cur.execute(
@@ -113,13 +149,18 @@ def kv_set_if_absent(key1: str, key2: str, key3: str, value: str, note: Optional
         INSERT OR IGNORE INTO Kvs_M(key1,key2,key3,value,note)
         VALUES(?,?,?,?,?)
         """,
+<<<<<<< HEAD
         (key1, key2, key3, value, note),
+=======
+        (KVS_KEY1, key2, key3, value, note),
+>>>>>>> a6a1f270d9087c73e16344b2a3b358992e2f512f
     )
     conn.commit()
     conn.close()
 
 
 def ensure_default_kvs():
+<<<<<<< HEAD
     """
     只在不存在时写入默认值，避免覆盖你已有配置。
     key1: 大分类（auth/billing/security/discord/reminder 等）
@@ -140,11 +181,29 @@ def ensure_default_kvs():
     # 提醒策略
     kv_set_if_absent("reminder", "global", "expiry_days", "5", "提前几天提醒到期")
     kv_set_if_absent("reminder", "global", "scan_hours", "12", "扫描间隔（小时）")
+=======
+    # discord
+    kv_set_if_absent("discord", "review_channel_id", "0", "审核单输出频道ID")
+    kv_set_if_absent("discord", "remind_channel_id", "0", "到期提醒输出频道ID")
+    kv_set_if_absent("discord", "paid_role_id", "0", "付费会员角色ID")
+    kv_set_if_absent("discord", "admin_role_ids", "", "机器人管理员角色ID，逗号分隔")
+
+    # billing
+    kv_set_if_absent("billing", "month_price_label", "XXX円", "月费显示用（不参与实际支付）")
+
+    # reminder
+    kv_set_if_absent("reminder", "expiry_remind_days", "5", "提前几天提醒到期")
+    kv_set_if_absent("reminder", "scan_every_hours", "12", "扫描频率（小时），修改后需重启")
+>>>>>>> a6a1f270d9087c73e16344b2a3b358992e2f512f
 
 
 def load_runtime_settings() -> Dict[str, Any]:
     """
+<<<<<<< HEAD
     从 Kvs_M 读出运行时配置，返回 dict（bot.kcfg 使用）
+=======
+    从 Kvs_M 读出运行时配置，返回 dict。
+>>>>>>> a6a1f270d9087c73e16344b2a3b358992e2f512f
     """
     def as_int(v: Optional[str], default: int) -> int:
         try:
@@ -155,7 +214,11 @@ def load_runtime_settings() -> Dict[str, Any]:
     def as_csv_int_set(v: Optional[str]) -> set[int]:
         if not v:
             return set()
+<<<<<<< HEAD
         out: set[int] = set()
+=======
+        out = set()
+>>>>>>> a6a1f270d9087c73e16344b2a3b358992e2f512f
         for part in str(v).split(","):
             part = part.strip()
             if part.isdigit():
@@ -163,6 +226,7 @@ def load_runtime_settings() -> Dict[str, Any]:
         return out
 
     cfg = {
+<<<<<<< HEAD
         "review_channel_id": as_int(kv_get("discord", "channel", "review_id"), 0),
         "remind_channel_id": as_int(kv_get("discord", "channel", "remind_id"), 0),
         "paid_role_id": as_int(kv_get("discord", "role", "paid_id"), 0),
@@ -170,6 +234,15 @@ def load_runtime_settings() -> Dict[str, Any]:
         "month_price_label": kv_get("billing", "global", "month_price_label") or "XXX円",
         "expiry_days": as_int(kv_get("reminder", "global", "expiry_days"), 5),
         "scan_hours": as_int(kv_get("reminder", "global", "scan_hours"), 12),
+=======
+        "review_channel_id": as_int(kv_get("discord", "review_channel_id"), 0),
+        "remind_channel_id": as_int(kv_get("discord", "remind_channel_id"), 0),
+        "paid_role_id": as_int(kv_get("discord", "paid_role_id"), 0),
+        "admin_role_ids": as_csv_int_set(kv_get("discord", "admin_role_ids")),
+        "month_price_label": kv_get("billing", "month_price_label") or "XXX円",
+        "expiry_remind_days": as_int(kv_get("reminder", "expiry_remind_days"), 5),
+        "scan_every_hours": as_int(kv_get("reminder", "scan_every_hours"), 12),
+>>>>>>> a6a1f270d9087c73e16344b2a3b358992e2f512f
     }
     return cfg
 
