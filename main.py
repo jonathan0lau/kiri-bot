@@ -12,7 +12,7 @@ from storage_sqlite import (
     kv_upsert,
     kv_get,
 )
-from bot_views import PayPanelView
+from bot_views import PayPanelView, WelcomeProfileView
 
 
 intents = discord.Intents.default()
@@ -38,16 +38,71 @@ def is_dm(ctx: commands.Context) -> bool:
     return ctx.guild is None
 
 
+async def ensure_year_structure(year: int):
+    reload_kcfg()
+    admin_role_ids: set[int] = bot.kcfg.get("admin_role_ids", set())
+
+    for guild in bot.guilds:
+        print(f"[year-structure] guild={guild.name} ({guild.id}) year={year} start")
+        category = discord.utils.get(guild.categories, name="Paid Content")
+        if category is None:
+            category = await guild.create_category("Paid Content", reason=f"Ensure paid content category for {year}")
+            print(f"[year-structure] created category: {category.name}")
+        else:
+            print(f"[year-structure] skip category exists: {category.name}")
+
+        for month in range(1, 13):
+            role_name = f"Paid_{year}_{month:02d}"
+            channel_name = f"{year}-{month:02d}"
+
+            role = discord.utils.get(guild.roles, name=role_name)
+            if role is None:
+                role = await guild.create_role(name=role_name, reason=f"Ensure paid role for {year}-{month:02d}")
+                print(f"[year-structure] created role: {role_name}")
+            else:
+                print(f"[year-structure] skip role exists: {role_name}")
+
+            text_channel = discord.utils.get(category.text_channels, name=channel_name)
+            if text_channel is None:
+                text_channel = await guild.create_text_channel(
+                    name=channel_name,
+                    category=category,
+                    reason=f"Ensure paid channel for {year}-{month:02d}",
+                )
+                print(f"[year-structure] created channel: #{channel_name}")
+            else:
+                if text_channel.category_id != category.id:
+                    await text_channel.edit(category=category, reason="Fix paid channel category")
+                    print(f"[year-structure] fixed channel category: #{channel_name}")
+                else:
+                    print(f"[year-structure] skip channel exists: #{channel_name}")
+
+            overwrites = dict(text_channel.overwrites)
+            everyone_role = guild.default_role
+            overwrites[everyone_role] = discord.PermissionOverwrite(view_channel=False)
+            overwrites[role] = discord.PermissionOverwrite(view_channel=True, read_message_history=True)
+            for admin_role_id in admin_role_ids:
+                admin_role = guild.get_role(admin_role_id)
+                if admin_role is not None:
+                    overwrites[admin_role] = discord.PermissionOverwrite(view_channel=True, read_message_history=True)
+            await text_channel.edit(overwrites=overwrites, reason=f"Ensure paid channel overwrites for {year}-{month:02d}")
+            print(f"[year-structure] fixed overwrites: #{channel_name}")
+
+        print(f"[year-structure] guild={guild.name} ({guild.id}) year={year} done")
+
+
 @bot.event
 async def on_ready():
     init_db()
     reload_kcfg()
 
     bot.add_view(PayPanelView(bot))
+    bot.add_view(WelcomeProfileView(bot))
 
     print(f"READY: {bot.user} ({bot.user.id})")
     print("GUILDS:", [g.name for g in bot.guilds])
     print("KCFG:", bot.kcfg)
+    await ensure_year_structure(datetime.now(JST).year)
 
     if not expiring_reminder_tick.is_running():
         expiring_reminder_tick.start()
@@ -165,6 +220,22 @@ async def expiring_reminder_tick():
 
     bot._next_remind_at = now + timedelta(hours=scan_hours)
 
+
+
+@bot.event
+async def on_member_join(member: discord.Member):
+    reload_kcfg()
+
+    welcome_channel_id = int(bot.kcfg.get("welcome_channel_id", 0))
+    channel = member.guild.get_channel(welcome_channel_id) if welcome_channel_id else member.guild.system_channel
+    if channel is None:
+        return
+
+    msg = (
+        f"🎉 欢迎 {member.mention} 加入！\n"
+        "请点击下面按钮填写个人信息，方便大家快速认识你。"
+    )
+    await channel.send(msg, view=WelcomeProfileView(bot))
 
 if __name__ == "__main__":
     bot.run(DISCORD_TOKEN)

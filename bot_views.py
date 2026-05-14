@@ -11,11 +11,29 @@ from storage_sqlite import (
     reject_request,
     month_end_after_one_month,
     get_active_paypay_link,
+    upsert_user_profile,
+    set_user_paid_status,
 )
 
 
 def is_admin_member(member: discord.Member, admin_role_ids: set[int]) -> bool:
     return any(r.id in admin_role_ids for r in member.roles)
+
+
+def is_valid_birthday_mmdd(value: str) -> bool:
+    if len(value) != 5 or value[2] != "-":
+        return False
+    mm = value[:2]
+    dd = value[3:]
+    if not (mm.isdigit() and dd.isdigit()):
+        return False
+    m = int(mm)
+    d = int(dd)
+    if m < 1 or m > 12:
+        return False
+    if d < 1 or d > 31:
+        return False
+    return True
 
 
 class PayModal(discord.ui.Modal, title="付款信息提交"):
@@ -168,6 +186,8 @@ class ReviewView(discord.ui.View):
             await interaction.response.send_message("DB 更新失败（可能已被其他管理员处理）。", ephemeral=True)
             return
 
+        set_user_paid_status(guild.id, member.id, "paid", start_at, end_at)
+
         for child in self.children:
             if isinstance(child, discord.ui.Button):
                 child.disabled = True
@@ -207,6 +227,9 @@ class ReviewView(discord.ui.View):
             await interaction.response.send_message("操作失败（可能已被其他管理员处理）。", ephemeral=True)
             return
 
+        if interaction.guild is not None:
+            set_user_paid_status(interaction.guild.id, int(row["user_id"]), "free", None, None)
+
         for child in self.children:
             if isinstance(child, discord.ui.Button):
                 child.disabled = True
@@ -222,3 +245,83 @@ class ReviewView(discord.ui.View):
                     await member.send("❌ 你的付费申请未通过审核。如有疑问请联系管理员。")
                 except Exception:
                     pass
+
+
+class WelcomeProfileModal(discord.ui.Modal, title="完善新人信息"):
+    display_name = discord.ui.TextInput(
+        label="称呼 / 昵称",
+        placeholder="例如：Kiri",
+        required=True,
+        max_length=64,
+    )
+    profile_text = discord.ui.TextInput(
+        label="个人介绍",
+        placeholder="简单介绍一下你自己~",
+        style=discord.TextStyle.paragraph,
+        required=False,
+        max_length=300,
+    )
+    contact = discord.ui.TextInput(
+        label="联系方式（可选）",
+        placeholder="例如：Discord ID、游戏ID",
+        required=False,
+        max_length=100,
+    )
+    twitter_id = discord.ui.TextInput(
+        label="Twitter ID（可选）",
+        placeholder="例如：kiri_bot（不含@）",
+        required=False,
+        max_length=50,
+    )
+    twitter_name = discord.ui.TextInput(
+        label="Twitter 显示名（可选）",
+        placeholder="例如：Kiri",
+        required=False,
+        max_length=80,
+    )
+    birthday_mmdd = discord.ui.TextInput(
+        label="生日（可选，MM-DD）",
+        placeholder="例如：07-21",
+        required=False,
+        max_length=5,
+    )
+
+    def __init__(self, bot: commands.Bot):
+        super().__init__(timeout=300)
+        self.bot = bot
+
+    async def on_submit(self, interaction: discord.Interaction):
+        if interaction.guild_id is None:
+            await interaction.response.send_message("请在服务器内使用该按钮。", ephemeral=True)
+            return
+
+        birthday_text = str(self.birthday_mmdd.value).strip() if self.birthday_mmdd.value else None
+        if birthday_text and not is_valid_birthday_mmdd(birthday_text):
+            await interaction.response.send_message("生日格式不正确，请使用 MM-DD（例如 07-21）。", ephemeral=True)
+            return
+
+        upsert_user_profile(
+            guild_id=interaction.guild_id,
+            user_id=interaction.user.id,
+            display_name=str(self.display_name.value).strip(),
+            profile_text=str(self.profile_text.value).strip() if self.profile_text.value else None,
+            contact=str(self.contact.value).strip() if self.contact.value else None,
+            twitter_id=str(self.twitter_id.value).strip() if self.twitter_id.value else None,
+            twitter_name=str(self.twitter_name.value).strip() if self.twitter_name.value else None,
+            birthday_mmdd=birthday_text,
+        )
+        await interaction.response.send_message("✅ 已保存你的个人信息，欢迎加入！", ephemeral=True)
+
+
+class WelcomeProfileView(discord.ui.View):
+    def __init__(self, bot: commands.Bot):
+        super().__init__(timeout=None)
+        self.bot = bot
+
+    @discord.ui.button(
+        label="填写个人信息",
+        style=discord.ButtonStyle.primary,
+        custom_id="welcome:fill_profile",
+    )
+    async def fill_profile(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.send_modal(WelcomeProfileModal(self.bot))

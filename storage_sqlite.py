@@ -13,6 +13,37 @@ def _conn():
     return conn
 
 
+def _ensure_user_t_schema(cur: sqlite3.Cursor):
+    cur.execute("PRAGMA table_info(user_T)")
+    rows = cur.fetchall()
+    existing = {r[1] for r in rows}
+
+    required_columns = [
+        ("guild_id", "TEXT"),
+        ("user_id", "TEXT"),
+        ("display_name", "TEXT"),
+        ("profile_text", "TEXT"),
+        ("contact", "TEXT"),
+        ("twitter_id", "TEXT"),
+        ("twitter_name", "TEXT"),
+        ("birthday_mmdd", "TEXT"),
+        ("paid_start_at", "TEXT"),
+        ("paid_end_at", "TEXT"),
+        ("status", "TEXT"),
+        ("created_at", "TEXT"),
+        ("updated_at", "TEXT"),
+    ]
+
+    for name, typ in required_columns:
+        if name in existing:
+            continue
+        if name == "status":
+            cur.execute("ALTER TABLE user_T ADD COLUMN status TEXT DEFAULT 'free'")
+        else:
+            cur.execute(f"ALTER TABLE user_T ADD COLUMN {name} {typ}")
+
+
+
 def init_db():
     conn = _conn()
     cur = conn.cursor()
@@ -52,6 +83,29 @@ def init_db():
         """
     )
     cur.execute("CREATE INDEX IF NOT EXISTS idx_paypay_active ON paypay_links(is_active)")
+
+    # 新人资料表（user_T）
+    cur.execute(
+        """
+        CREATE TABLE IF NOT EXISTS user_T (
+            guild_id      TEXT NOT NULL,
+            user_id       TEXT NOT NULL,
+            display_name  TEXT NOT NULL,
+            profile_text  TEXT,
+            contact       TEXT,
+            twitter_id    TEXT,
+            twitter_name  TEXT,
+            birthday_mmdd TEXT,
+            paid_start_at TEXT,
+            paid_end_at   TEXT,
+            status        TEXT NOT NULL DEFAULT 'free',
+            created_at    TEXT NOT NULL,
+            updated_at    TEXT NOT NULL,
+            PRIMARY KEY (guild_id, user_id)
+        )
+        """
+    )
+    _ensure_user_t_schema(cur)
 
     # ===== Kvs_M 配置中心 =====
     cur.execute(
@@ -129,6 +183,7 @@ def ensure_default_kvs():
     # Discord 资源
     kv_set_if_absent("discord", "channel", "review_id", "0", "审核单输出频道ID")
     kv_set_if_absent("discord", "channel", "remind_id", "0", "到期提醒输出频道ID")
+    kv_set_if_absent("discord", "channel", "welcome_id", "0", "新人欢迎帖输出频道ID")
     kv_set_if_absent("discord", "role", "paid_id", "0", "付费会员角色ID")
 
     # 权限
@@ -165,6 +220,7 @@ def load_runtime_settings() -> Dict[str, Any]:
     cfg = {
         "review_channel_id": as_int(kv_get("discord", "channel", "review_id"), 0),
         "remind_channel_id": as_int(kv_get("discord", "channel", "remind_id"), 0),
+        "welcome_channel_id": as_int(kv_get("discord", "channel", "welcome_id"), 0),
         "paid_role_id": as_int(kv_get("discord", "role", "paid_id"), 0),
         "admin_role_ids": as_csv_int_set(kv_get("auth", "role", "admin_role_ids")),
         "month_price_label": kv_get("billing", "global", "month_price_label") or "XXX円",
@@ -172,6 +228,102 @@ def load_runtime_settings() -> Dict[str, Any]:
         "scan_hours": as_int(kv_get("reminder", "global", "scan_hours"), 12),
     }
     return cfg
+
+
+def upsert_user_profile(
+    guild_id: int,
+    user_id: int,
+    display_name: str,
+    profile_text: Optional[str],
+    contact: Optional[str],
+    twitter_id: Optional[str],
+    twitter_name: Optional[str],
+    birthday_mmdd: Optional[str],
+) -> None:
+    now = datetime.now(JST).isoformat()
+    conn = _conn()
+    cur = conn.cursor()
+    cur.execute(
+        """
+        INSERT INTO user_T(
+            guild_id, user_id, display_name, profile_text, contact, twitter_id, twitter_name,
+            birthday_mmdd, status, created_at, updated_at
+        )
+        VALUES(?,?,?,?,?,?,?,?, 'free', ?,?)
+        ON CONFLICT(guild_id, user_id)
+        DO UPDATE SET
+            display_name=excluded.display_name,
+            profile_text=excluded.profile_text,
+            contact=excluded.contact,
+            twitter_id=excluded.twitter_id,
+            twitter_name=excluded.twitter_name,
+            birthday_mmdd=excluded.birthday_mmdd,
+            updated_at=excluded.updated_at
+        """,
+        (
+            str(guild_id),
+            str(user_id),
+            display_name,
+            profile_text,
+            contact,
+            twitter_id,
+            twitter_name,
+            birthday_mmdd,
+            now,
+            now,
+        ),
+    )
+    conn.commit()
+    conn.close()
+
+
+def set_user_paid_status(
+    guild_id: int,
+    user_id: int,
+    status: str,
+    paid_start_at: Optional[datetime],
+    paid_end_at: Optional[datetime],
+) -> None:
+    now = datetime.now(JST).isoformat()
+    conn = _conn()
+    cur = conn.cursor()
+    cur.execute(
+        """
+        UPDATE user_T
+        SET status=?,
+            paid_start_at=?,
+            paid_end_at=?,
+            updated_at=?
+        WHERE guild_id=? AND user_id=?
+        """,
+        (
+            status,
+            paid_start_at.isoformat() if paid_start_at else None,
+            paid_end_at.isoformat() if paid_end_at else None,
+            now,
+            str(guild_id),
+            str(user_id),
+        ),
+    )
+    if cur.rowcount == 0:
+        cur.execute(
+            """
+            INSERT INTO user_T(guild_id, user_id, display_name, status, paid_start_at, paid_end_at, created_at, updated_at)
+            VALUES(?,?,?,?,?,?,?,?)
+            """,
+            (
+                str(guild_id),
+                str(user_id),
+                "",
+                status,
+                paid_start_at.isoformat() if paid_start_at else None,
+                paid_end_at.isoformat() if paid_end_at else None,
+                now,
+                now,
+            ),
+        )
+    conn.commit()
+    conn.close()
 
 
 # ===== 业务规则：一个月后的月末 23:59:59（JST） =====
