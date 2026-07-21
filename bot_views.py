@@ -13,6 +13,8 @@ from storage_sqlite import (
     get_active_paypay_link,
     upsert_user_profile,
     set_user_paid_status,
+    months_covered,
+    upsert_month_entitlements,
 )
 
 
@@ -170,31 +172,76 @@ class ReviewView(discord.ui.View):
             await interaction.response.send_message("找不到该用户（可能已退群）。", ephemeral=True)
             return
 
-        paid_role_id = int(self.bot.kcfg.get("paid_role_id", 0))
-        paid_role = guild.get_role(paid_role_id)
-        if paid_role is None:
-            await interaction.response.send_message("Paid 角色配置不正确（找不到角色）。", ephemeral=True)
-            return
-
         start_at = discord.utils.utcnow().replace(tzinfo=timezone.utc).astimezone(JST)
         end_at = month_end_after_one_month(start_at)
+        covered = months_covered(start_at, end_at)
 
-        await member.add_roles(paid_role, reason="Payment approved")
+        # 创建角色/频道可能超过 Discord interaction 的响应时限，先确认收到操作。
+        await interaction.response.defer(ephemeral=True)
 
-        ok = approve_request(self.request_id, interaction.user.id, start_at, end_at)
-        if not ok:
-            await interaction.response.send_message("DB 更新失败（可能已被其他管理员处理）。", ephemeral=True)
+        # entitlement 必须先落库；后续 Discord 操作失败时可安全重试。
+        try:
+            upsert_month_entitlements(member.id, covered, self.request_id)
+        except Exception as exc:
+            await interaction.followup.send(
+                f"❌ 审核失败：写入月份授权记录时发生错误：{exc}",
+                ephemeral=False,
+            )
             return
 
-        set_user_paid_status(guild.id, member.id, "paid", start_at, end_at)
+        for yyyymm in covered:
+            y = int(yyyymm[:4])
+            m = int(yyyymm[4:6])
+            ensure_month = getattr(self.bot, "ensure_month_structure", None)
+            if ensure_month is None:
+                await interaction.followup.send(
+                    f"❌ 审核失败：缺少 ensure_month_structure，无法授权月份 {yyyymm}。"
+                    "月份授权记录已保存，修复配置后可重新审核。",
+                    ephemeral=False,
+                )
+                return
+            try:
+                month_role = await ensure_month(guild, y, m)
+                await member.add_roles(month_role, reason=f"Payment approved ({yyyymm})")
+            except Exception as exc:
+                await interaction.followup.send(
+                    f"❌ 审核失败：处理月份 {yyyymm} 的角色或频道时发生错误：{exc}\n"
+                    "月份授权记录已保存；排除 Discord 权限或层级问题后可重新审核。",
+                    ephemeral=False,
+                )
+                return
+
+        try:
+            ok = approve_request(self.request_id, interaction.user.id, start_at, end_at)
+        except Exception as exc:
+            await interaction.followup.send(
+                f"❌ 月份角色已授予，但更新申请状态时发生数据库错误：{exc}。请人工检查申请记录。",
+                ephemeral=False,
+            )
+            return
+        if not ok:
+            await interaction.followup.send(
+                "❌ 申请状态更新失败，可能已被其他管理员处理。月份角色可能已经授予，请检查申请记录。",
+                ephemeral=False,
+            )
+            return
+
+        try:
+            set_user_paid_status(guild.id, member.id, "paid", start_at, end_at)
+        except Exception as exc:
+            await interaction.followup.send(
+                f"❌ 申请和月份角色已处理，但更新会员资料时发生错误：{exc}。请人工检查 user_T。",
+                ephemeral=False,
+            )
+            return
 
         for child in self.children:
             if isinstance(child, discord.ui.Button):
                 child.disabled = True
         await interaction.message.edit(view=self)
 
-        await interaction.response.send_message(
-            f"已通过：{member.mention} 已获得 Paid 角色。\n"
+        await interaction.followup.send(
+            f"已通过：{member.mention} 已获得按月访问角色（{', '.join(covered)}）。\n"
             f"有效期：{start_at.strftime('%Y-%m-%d')} ~ {end_at.strftime('%Y-%m-%d %H:%M:%S')} (JST)",
             ephemeral=True,
         )

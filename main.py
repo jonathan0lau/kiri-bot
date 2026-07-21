@@ -1,6 +1,7 @@
 import discord
 from discord.ext import commands, tasks
 from datetime import datetime, timedelta
+from typing import Optional
 
 from config import DISCORD_TOKEN, KVS_ADMIN_KEY, JST
 from storage_sqlite import (
@@ -44,51 +45,62 @@ async def ensure_year_structure(year: int):
 
     for guild in bot.guilds:
         print(f"[year-structure] guild={guild.name} ({guild.id}) year={year} start")
-        category = discord.utils.get(guild.categories, name="Paid Content")
-        if category is None:
-            category = await guild.create_category("Paid Content", reason=f"Ensure paid content category for {year}")
-            print(f"[year-structure] created category: {category.name}")
-        else:
-            print(f"[year-structure] skip category exists: {category.name}")
-
         for month in range(1, 13):
-            role_name = f"Paid_{year}_{month:02d}"
-            channel_name = f"{year}-{month:02d}"
-
-            role = discord.utils.get(guild.roles, name=role_name)
-            if role is None:
-                role = await guild.create_role(name=role_name, reason=f"Ensure paid role for {year}-{month:02d}")
-                print(f"[year-structure] created role: {role_name}")
-            else:
-                print(f"[year-structure] skip role exists: {role_name}")
-
-            text_channel = discord.utils.get(category.text_channels, name=channel_name)
-            if text_channel is None:
-                text_channel = await guild.create_text_channel(
-                    name=channel_name,
-                    category=category,
-                    reason=f"Ensure paid channel for {year}-{month:02d}",
-                )
-                print(f"[year-structure] created channel: #{channel_name}")
-            else:
-                if text_channel.category_id != category.id:
-                    await text_channel.edit(category=category, reason="Fix paid channel category")
-                    print(f"[year-structure] fixed channel category: #{channel_name}")
-                else:
-                    print(f"[year-structure] skip channel exists: #{channel_name}")
-
-            overwrites = dict(text_channel.overwrites)
-            everyone_role = guild.default_role
-            overwrites[everyone_role] = discord.PermissionOverwrite(view_channel=False)
-            overwrites[role] = discord.PermissionOverwrite(view_channel=True, read_message_history=True)
-            for admin_role_id in admin_role_ids:
-                admin_role = guild.get_role(admin_role_id)
-                if admin_role is not None:
-                    overwrites[admin_role] = discord.PermissionOverwrite(view_channel=True, read_message_history=True)
-            await text_channel.edit(overwrites=overwrites, reason=f"Ensure paid channel overwrites for {year}-{month:02d}")
-            print(f"[year-structure] fixed overwrites: #{channel_name}")
+            await ensure_month_structure(guild, year, month, admin_role_ids)
 
         print(f"[year-structure] guild={guild.name} ({guild.id}) year={year} done")
+
+
+async def ensure_month_structure(
+    guild: discord.Guild,
+    year: int,
+    month: int,
+    admin_role_ids: Optional[set[int]] = None,
+) -> discord.Role:
+    if admin_role_ids is None:
+        reload_kcfg()
+        admin_role_ids = bot.kcfg.get("admin_role_ids", set())
+
+    category = discord.utils.get(guild.categories, name="Paid Content")
+    if category is None:
+        category = await guild.create_category("Paid Content", reason=f"Ensure paid content category for {year}")
+        print(f"[month-structure] created category: {category.name}")
+
+    role_name = f"Paid_{year}_{month:02d}"
+    channel_name = f"{year}-{month:02d}"
+
+    role = discord.utils.get(guild.roles, name=role_name)
+    if role is None:
+        role = await guild.create_role(name=role_name, reason=f"Ensure paid role for {year}-{month:02d}")
+        print(f"[month-structure] created role: {role_name}")
+    else:
+        print(f"[month-structure] skip role exists: {role_name}")
+
+    text_channel = discord.utils.get(category.text_channels, name=channel_name)
+    if text_channel is None:
+        text_channel = await guild.create_text_channel(
+            name=channel_name,
+            category=category,
+            reason=f"Ensure paid channel for {year}-{month:02d}",
+        )
+        print(f"[month-structure] created channel: #{channel_name}")
+    else:
+        if text_channel.category_id != category.id:
+            await text_channel.edit(category=category, reason="Fix paid channel category")
+            print(f"[month-structure] fixed channel category: #{channel_name}")
+        else:
+            print(f"[month-structure] skip channel exists: #{channel_name}")
+
+    overwrites = dict(text_channel.overwrites)
+    overwrites[guild.default_role] = discord.PermissionOverwrite(view_channel=False)
+    overwrites[role] = discord.PermissionOverwrite(view_channel=True, read_message_history=True)
+    for admin_role_id in admin_role_ids:
+        admin_role = guild.get_role(admin_role_id)
+        if admin_role is not None:
+            overwrites[admin_role] = discord.PermissionOverwrite(view_channel=True, read_message_history=True)
+    await text_channel.edit(overwrites=overwrites, reason=f"Ensure paid channel overwrites for {year}-{month:02d}")
+    print(f"[month-structure] fixed overwrites: #{channel_name}")
+    return role
 
 
 @bot.event
@@ -98,6 +110,7 @@ async def on_ready():
 
     bot.add_view(PayPanelView(bot))
     bot.add_view(WelcomeProfileView(bot))
+    bot.ensure_month_structure = ensure_month_structure
 
     print(f"READY: {bot.user} ({bot.user.id})")
     print("GUILDS:", [g.name for g in bot.guilds])

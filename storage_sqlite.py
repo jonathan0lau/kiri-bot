@@ -84,6 +84,19 @@ def init_db():
     )
     cur.execute("CREATE INDEX IF NOT EXISTS idx_paypay_active ON paypay_links(is_active)")
 
+    # 按月授权记录（同一用户同一月份只记录一次）
+    cur.execute(
+        """
+        CREATE TABLE IF NOT EXISTS entitlement_T (
+            user_id    TEXT NOT NULL,
+            yyyymm     TEXT NOT NULL,
+            request_id TEXT NOT NULL,
+            granted_at TEXT NOT NULL,
+            PRIMARY KEY (user_id, yyyymm)
+        )
+        """
+    )
+
     # 新人资料表（user_T）
     cur.execute(
         """
@@ -324,6 +337,60 @@ def set_user_paid_status(
         )
     conn.commit()
     conn.close()
+
+
+def months_covered(start_at: datetime, end_at: datetime) -> List[str]:
+    """返回起止时间在 JST 下覆盖的所有自然月（包含起止月）。"""
+    if start_at.tzinfo is None:
+        start_at = start_at.replace(tzinfo=JST)
+    else:
+        start_at = start_at.astimezone(JST)
+    if end_at.tzinfo is None:
+        end_at = end_at.replace(tzinfo=JST)
+    else:
+        end_at = end_at.astimezone(JST)
+
+    if end_at < start_at:
+        raise ValueError("end_at 不能早于 start_at")
+
+    y, m = start_at.year, start_at.month
+    ey, em = end_at.year, end_at.month
+    out: List[str] = []
+    while (y < ey) or (y == ey and m <= em):
+        out.append(f"{y}{m:02d}")
+        m += 1
+        if m == 13:
+            m = 1
+            y += 1
+    return out
+
+
+def upsert_month_entitlements(user_id: int, yyyymms: List[str], request_id: str) -> int:
+    """以单个事务写入按月授权，返回新插入的行数。"""
+    granted_at = datetime.now(JST).isoformat()
+    conn = _conn()
+    try:
+        cur = conn.cursor()
+        before = conn.total_changes
+        cur.executemany(
+            """
+            INSERT OR IGNORE INTO entitlement_T(user_id, yyyymm, request_id, granted_at)
+            VALUES (?, ?, ?, ?)
+            """,
+            [(str(user_id), yyyymm, request_id, granted_at) for yyyymm in yyyymms],
+        )
+        conn.commit()
+        return conn.total_changes - before
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+
+
+def grant_month_entitlement(user_id: int, yyyymm: str, request_id: str) -> bool:
+    """兼容单月调用；新流程优先使用 upsert_month_entitlements。"""
+    return upsert_month_entitlements(user_id, [yyyymm], request_id) == 1
 
 
 # ===== 业务规则：一个月后的月末 23:59:59（JST） =====
