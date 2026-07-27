@@ -5,6 +5,7 @@ from datetime import datetime, timedelta
 from typing import Optional, Tuple, Dict, Any, List
 
 from config import DB_PATH, JST
+from i18n import DEFAULT_LANG, normalize_lang
 
 
 def _conn():
@@ -13,36 +14,94 @@ def _conn():
     return conn
 
 
-def _ensure_user_t_schema(cur: sqlite3.Cursor):
+def _ensure_profile_user_t_schema(cur: sqlite3.Cursor):
     cur.execute("PRAGMA table_info(user_T)")
     rows = cur.fetchall()
-    existing = {r[1] for r in rows}
+    if not rows:
+        cur.execute(
+            """
+            CREATE TABLE user_T (
+                user_id        TEXT PRIMARY KEY,
+                nickname       TEXT NOT NULL,
+                birthday_mmdd  TEXT,
+                twitter_handle TEXT,
+                twitter_name   TEXT,
+                note           TEXT,
+                paid_start_at  TEXT,
+                paid_end_at    TEXT,
+                status         TEXT NOT NULL DEFAULT 'free',
+                created_at     TEXT NOT NULL,
+                updated_at     TEXT NOT NULL
+            )
+            """
+        )
+        return
 
-    required_columns = [
-        ("guild_id", "TEXT"),
-        ("user_id", "TEXT"),
-        ("display_name", "TEXT"),
-        ("profile_text", "TEXT"),
-        ("contact", "TEXT"),
-        ("twitter_id", "TEXT"),
-        ("twitter_name", "TEXT"),
-        ("birthday_mmdd", "TEXT"),
-        ("paid_start_at", "TEXT"),
-        ("paid_end_at", "TEXT"),
-        ("status", "TEXT"),
-        ("created_at", "TEXT"),
-        ("updated_at", "TEXT"),
-    ]
+    columns = {r[1]: r for r in rows}
+    user_id_is_pk = "user_id" in columns and int(columns["user_id"][5]) == 1
+    required = {"nickname", "birthday_mmdd", "twitter_handle", "twitter_name", "note", "created_at", "updated_at"}
+    if user_id_is_pk and required.issubset(columns):
+        for name, typ in [
+            ("paid_start_at", "TEXT"),
+            ("paid_end_at", "TEXT"),
+            ("status", "TEXT NOT NULL DEFAULT 'free'"),
+        ]:
+            if name not in columns:
+                cur.execute(f"ALTER TABLE user_T ADD COLUMN {name} {typ}")
+        return
 
-    for name, typ in required_columns:
-        if name in existing:
-            continue
-        if name == "status":
-            cur.execute("ALTER TABLE user_T ADD COLUMN status TEXT DEFAULT 'free'")
-        else:
-            cur.execute(f"ALTER TABLE user_T ADD COLUMN {name} {typ}")
+    legacy_name = f"user_T_legacy_{datetime.now(JST).strftime('%Y%m%d%H%M%S')}"
+    cur.execute(f"ALTER TABLE user_T RENAME TO {legacy_name}")
+    cur.execute(
+        """
+        CREATE TABLE user_T (
+            user_id        TEXT PRIMARY KEY,
+            nickname       TEXT NOT NULL,
+            birthday_mmdd  TEXT,
+            twitter_handle TEXT,
+            twitter_name   TEXT,
+            note           TEXT,
+            paid_start_at  TEXT,
+            paid_end_at    TEXT,
+            status         TEXT NOT NULL DEFAULT 'free',
+            created_at     TEXT NOT NULL,
+            updated_at     TEXT NOT NULL
+        )
+        """
+    )
+    cur.execute(f"PRAGMA table_info({legacy_name})")
+    legacy_cols = {r[1] for r in cur.fetchall()}
 
+    def expr(*names: str, default: str = "NULL") -> str:
+        for name in names:
+            if name in legacy_cols:
+                return name
+        return default
 
+    cur.execute(
+        f"""
+        INSERT OR IGNORE INTO user_T(
+            user_id, nickname, birthday_mmdd, twitter_handle, twitter_name, note,
+            paid_start_at, paid_end_at, status, created_at, updated_at
+        )
+        SELECT
+            user_id,
+            COALESCE(NULLIF({expr('nickname', 'display_name', default="''")}, ''), user_id),
+            {expr('birthday_mmdd')},
+            {expr('twitter_handle', 'twitter_id')},
+            {expr('twitter_name')},
+            {expr('note', 'profile_text')},
+            {expr('paid_start_at')},
+            {expr('paid_end_at')},
+            COALESCE({expr('status', default="'free'")}, 'free'),
+            COALESCE({expr('created_at', default='NULL')}, ?),
+            COALESCE({expr('updated_at', default='NULL')}, ?)
+        FROM {legacy_name}
+        WHERE user_id IS NOT NULL
+        """
+        ,
+        (datetime.now(JST).isoformat(), datetime.now(JST).isoformat()),
+    )
 
 def init_db():
     conn = _conn()
@@ -98,27 +157,7 @@ def init_db():
     )
 
     # 新人资料表（user_T）
-    cur.execute(
-        """
-        CREATE TABLE IF NOT EXISTS user_T (
-            guild_id      TEXT NOT NULL,
-            user_id       TEXT NOT NULL,
-            display_name  TEXT NOT NULL,
-            profile_text  TEXT,
-            contact       TEXT,
-            twitter_id    TEXT,
-            twitter_name  TEXT,
-            birthday_mmdd TEXT,
-            paid_start_at TEXT,
-            paid_end_at   TEXT,
-            status        TEXT NOT NULL DEFAULT 'free',
-            created_at    TEXT NOT NULL,
-            updated_at    TEXT NOT NULL,
-            PRIMARY KEY (guild_id, user_id)
-        )
-        """
-    )
-    _ensure_user_t_schema(cur)
+    _ensure_profile_user_t_schema(cur)
 
     # ===== Kvs_M 配置中心 =====
     cur.execute(
@@ -194,20 +233,23 @@ def ensure_default_kvs():
     key3: 小类（具体参数名）
     """
     # Discord 资源
-    kv_set_if_absent("discord", "channel", "review_id", "0", "审核单输出频道ID")
-    kv_set_if_absent("discord", "channel", "remind_id", "0", "到期提醒输出频道ID")
-    kv_set_if_absent("discord", "channel", "welcome_id", "0", "新人欢迎帖输出频道ID")
-    kv_set_if_absent("discord", "role", "paid_id", "0", "付费会员角色ID")
+    kv_set_if_absent("discord", "global", "lang", DEFAULT_LANG, "Bot表示言語：ja/zh/zh-tw/en/ko")
+    kv_set_if_absent("discord", "channel", "review_id", "0", "審査チャンネルID")
+    kv_set_if_absent("discord", "channel", "remind_id", "0", "期限通知チャンネルID")
+    kv_set_if_absent("discord", "channel", "welcome_id", "0", "ウェルカムチャンネルID")
+    kv_set_if_absent("discord", "channel", "profile_id", "0", "プロフィールパネルチャンネルID")
+    kv_set_if_absent("discord", "role", "paid_id", "0", "有料メンバーロールID")
 
     # 权限
-    kv_set_if_absent("auth", "role", "admin_role_ids", "", "机器人管理员角色ID，逗号分隔")
+    kv_set_if_absent("auth", "role", "admin_role_ids", "", "Bot管理者ロールID（カンマ区切り）")
 
     # 付费显示
-    kv_set_if_absent("billing", "global", "month_price_label", "XXX円", "月费显示用（不参与实际支付）")
+    kv_set_if_absent("billing", "global", "month_price_label", "XXX円", "月額表示用（実決済には使用しない）")
 
     # 提醒策略
-    kv_set_if_absent("reminder", "global", "expiry_days", "5", "提前几天提醒到期")
-    kv_set_if_absent("reminder", "global", "scan_hours", "12", "扫描间隔（小时）")
+    kv_set_if_absent("reminder", "global", "expiry_days", "5", "期限切れ何日前に通知するか")
+    kv_set_if_absent("reminder", "global", "scan_hours", "12", "通知スキャン間隔（時間）")
+    kv_set_if_absent("reminder", "global", "sync_enabled", "1", "毎日03:00 JSTの月別ロール同期を有効化：1/0")
 
 
 def load_runtime_settings() -> Dict[str, Any]:
@@ -230,28 +272,34 @@ def load_runtime_settings() -> Dict[str, Any]:
                 out.add(int(part))
         return out
 
+    def as_bool(v: Optional[str], default: bool) -> bool:
+        if v is None or str(v).strip() == "":
+            return default
+        return str(v).strip().lower() in {"1", "true", "yes", "on", "enabled"}
+
     cfg = {
         "review_channel_id": as_int(kv_get("discord", "channel", "review_id"), 0),
+        "lang": normalize_lang(kv_get("discord", "global", "lang")),
         "remind_channel_id": as_int(kv_get("discord", "channel", "remind_id"), 0),
         "welcome_channel_id": as_int(kv_get("discord", "channel", "welcome_id"), 0),
+        "profile_channel_id": as_int(kv_get("discord", "channel", "profile_id"), 0),
         "paid_role_id": as_int(kv_get("discord", "role", "paid_id"), 0),
         "admin_role_ids": as_csv_int_set(kv_get("auth", "role", "admin_role_ids")),
         "month_price_label": kv_get("billing", "global", "month_price_label") or "XXX円",
         "expiry_days": as_int(kv_get("reminder", "global", "expiry_days"), 5),
         "scan_hours": as_int(kv_get("reminder", "global", "scan_hours"), 12),
+        "sync_enabled": as_bool(kv_get("reminder", "global", "sync_enabled"), True),
     }
     return cfg
 
 
 def upsert_user_profile(
-    guild_id: int,
     user_id: int,
-    display_name: str,
-    profile_text: Optional[str],
-    contact: Optional[str],
-    twitter_id: Optional[str],
-    twitter_name: Optional[str],
+    nickname: str,
     birthday_mmdd: Optional[str],
+    twitter_handle: Optional[str],
+    twitter_name: Optional[str],
+    note: Optional[str],
 ) -> None:
     now = datetime.now(JST).isoformat()
     conn = _conn()
@@ -259,35 +307,40 @@ def upsert_user_profile(
     cur.execute(
         """
         INSERT INTO user_T(
-            guild_id, user_id, display_name, profile_text, contact, twitter_id, twitter_name,
-            birthday_mmdd, status, created_at, updated_at
+            user_id, nickname, birthday_mmdd, twitter_handle, twitter_name, note, created_at, updated_at
         )
-        VALUES(?,?,?,?,?,?,?,?, 'free', ?,?)
-        ON CONFLICT(guild_id, user_id)
+        VALUES(?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(user_id)
         DO UPDATE SET
-            display_name=excluded.display_name,
-            profile_text=excluded.profile_text,
-            contact=excluded.contact,
-            twitter_id=excluded.twitter_id,
-            twitter_name=excluded.twitter_name,
+            nickname=excluded.nickname,
             birthday_mmdd=excluded.birthday_mmdd,
+            twitter_handle=excluded.twitter_handle,
+            twitter_name=excluded.twitter_name,
+            note=excluded.note,
             updated_at=excluded.updated_at
         """,
         (
-            str(guild_id),
             str(user_id),
-            display_name,
-            profile_text,
-            contact,
-            twitter_id,
-            twitter_name,
+            nickname,
             birthday_mmdd,
+            twitter_handle,
+            twitter_name,
+            note,
             now,
             now,
         ),
     )
     conn.commit()
     conn.close()
+
+
+def get_user_profile(user_id: int):
+    conn = _conn()
+    cur = conn.cursor()
+    cur.execute("SELECT * FROM user_T WHERE user_id=?", (str(user_id),))
+    row = cur.fetchone()
+    conn.close()
+    return row
 
 
 def set_user_paid_status(
@@ -307,25 +360,23 @@ def set_user_paid_status(
             paid_start_at=?,
             paid_end_at=?,
             updated_at=?
-        WHERE guild_id=? AND user_id=?
+        WHERE user_id=?
         """,
         (
             status,
             paid_start_at.isoformat() if paid_start_at else None,
             paid_end_at.isoformat() if paid_end_at else None,
             now,
-            str(guild_id),
             str(user_id),
         ),
     )
     if cur.rowcount == 0:
         cur.execute(
             """
-            INSERT INTO user_T(guild_id, user_id, display_name, status, paid_start_at, paid_end_at, created_at, updated_at)
-            VALUES(?,?,?,?,?,?,?,?)
+            INSERT INTO user_T(user_id, nickname, status, paid_start_at, paid_end_at, created_at, updated_at)
+            VALUES(?,?,?,?,?,?,?)
             """,
             (
-                str(guild_id),
                 str(user_id),
                 "",
                 status,
@@ -351,7 +402,7 @@ def months_covered(start_at: datetime, end_at: datetime) -> List[str]:
         end_at = end_at.astimezone(JST)
 
     if end_at < start_at:
-        raise ValueError("end_at 不能早于 start_at")
+        raise ValueError("end_at は start_at より前にできません")
 
     y, m = start_at.year, start_at.month
     ey, em = end_at.year, end_at.month
@@ -391,6 +442,21 @@ def upsert_month_entitlements(user_id: int, yyyymms: List[str], request_id: str)
 def grant_month_entitlement(user_id: int, yyyymm: str, request_id: str) -> bool:
     """兼容单月调用；新流程优先使用 upsert_month_entitlements。"""
     return upsert_month_entitlements(user_id, [yyyymm], request_id) == 1
+
+
+def list_entitlements():
+    conn = _conn()
+    cur = conn.cursor()
+    cur.execute(
+        """
+        SELECT user_id, yyyymm, request_id, granted_at
+        FROM entitlement_T
+        ORDER BY user_id, yyyymm
+        """
+    )
+    rows = cur.fetchall()
+    conn.close()
+    return rows
 
 
 # ===== 业务规则：一个月后的月末 23:59:59（JST） =====
