@@ -348,13 +348,13 @@ class ProfileModal(discord.ui.Modal):
         max_length=5,
     )
     twitter_handle = discord.ui.TextInput(
-        label="Twitter ID",
+        label="X（旧Twitter）ID",
         placeholder="例：kiri_bot（@なし）",
         required=False,
         max_length=64,
     )
     twitter_name = discord.ui.TextInput(
-        label="Twitter名",
+        label="X（旧Twitter）名",
         placeholder="例：Kiri",
         required=False,
         max_length=80,
