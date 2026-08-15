@@ -2,8 +2,19 @@ import discord
 from discord.ext import commands, tasks
 from datetime import datetime, timedelta
 from typing import Optional
+import logging
+import os
 
-from config import DISCORD_TOKEN, KVS_ADMIN_KEY, JST
+from config import (
+    DISCORD_TOKEN,
+    KVS_ADMIN_KEY,
+    JST,
+    APP_ENV,
+    LOG_LEVEL,
+    MAIL_MODE,
+    SMTP_HOST,
+    MAIL_FROM_ADDRESS,
+)
 from storage_sqlite import (
     init_db,
     load_runtime_settings,
@@ -13,10 +24,40 @@ from storage_sqlite import (
     get_active_paypay_link,
     kv_upsert,
     kv_get,
+    create_product,
+    update_product_field,
+    set_product_status,
+    get_product,
+    list_products,
+    get_order,
+    list_order_deliveries,
+    mark_order_delivery_pending,
+    list_product_order_ids_for_review_views,
+    create_feed_post,
+    list_feed_posts,
+    create_poll,
+    get_poll,
+    vote_poll,
+    close_poll,
+    poll_results,
+    create_question,
+    answer_question,
+    list_questions,
+    create_club_event,
+    get_club_event,
+    join_club_event,
+    list_club_events,
+    set_supporter_level,
+    create_fan_submission,
+    pick_fan_submission,
+    export_public_products_json,
 )
-from bot_views import PayPanelView, WelcomeProfileView, ProfilePanelView
+from bot_views import PayPanelView, WelcomeProfileView, ProfilePanelView, ShopPanelView, ProductReviewView, deliver_product_order
 from i18n import t
 
+
+logging.basicConfig(level=getattr(logging, LOG_LEVEL.upper(), logging.INFO), format="%(asctime)s %(levelname)s %(name)s: %(message)s")
+logger = logging.getLogger(__name__)
 
 intents = discord.Intents.default()
 intents.guilds = True
@@ -45,6 +86,73 @@ def is_admin_member(member: discord.Member, admin_role_ids: set[int]) -> bool:
 
 def can_manage_bot(member: discord.Member, admin_role_ids: set[int]) -> bool:
     return member.guild_permissions.administrator or is_admin_member(member, admin_role_ids)
+
+
+def command_is_admin(ctx: commands.Context) -> bool:
+    admin_role_ids: set[int] = bot.kcfg.get("admin_role_ids", set())
+    return isinstance(ctx.author, discord.Member) and is_admin_member(ctx.author, admin_role_ids)
+
+
+def member_is_buyer(member: discord.Member) -> bool:
+    role_id = int(bot.kcfg.get("buyer_role_id", 0) or bot.kcfg.get("paid_role_id", 0) or 0)
+    return bool(role_id and any(role.id == role_id for role in member.roles))
+
+
+async def send_bot_log(message: str) -> None:
+    channel_id = int(bot.kcfg.get("bot_log_channel_id", 0) or 0)
+    if not channel_id:
+        return
+    ch = bot.get_channel(channel_id)
+    if ch is None:
+        return
+    try:
+        await ch.send(message[:1900])
+    except Exception as exc:
+        logger.warning("failed to send bot log: %s", exc)
+
+
+async def startup_self_check() -> list[str]:
+    lines: list[str] = ["Kiri Bot startup self-check"]
+    if not DISCORD_TOKEN or DISCORD_TOKEN == "PUT_YOUR_TOKEN_HERE":
+        lines.append("ERROR: DISCORD_TOKEN is not configured.")
+    if not KVS_ADMIN_KEY:
+        lines.append("WARN: KVS_ADMIN_KEY is empty; !kvs cannot be managed safely.")
+    for key, label in [
+        ("review_channel_id", "review channel"),
+        ("shop_channel_id", "shop channel"),
+        ("profile_channel_id", "profile channel"),
+    ]:
+        value = int(bot.kcfg.get(key, 0) or 0)
+        lines.append(f"{label}: {'OK' if value else 'WARN not configured'}")
+    buyer_role_id = int(bot.kcfg.get("buyer_role_id", 0) or 0)
+    paid_role_id = int(bot.kcfg.get("paid_role_id", 0) or 0)
+    lines.append(f"buyer role: {'OK' if buyer_role_id else ('fallback paid_id' if paid_role_id else 'WARN not configured')}")
+    if MAIL_MODE == "smtp":
+        if SMTP_HOST and MAIL_FROM_ADDRESS:
+            lines.append("mail: smtp configured")
+        elif APP_ENV == "production":
+            lines.append("ERROR: MAIL_MODE=smtp but SMTP_HOST or MAIL_FROM_ADDRESS is missing.")
+        else:
+            lines.append("WARN: MAIL_MODE=smtp is incomplete; delivery will fail until SMTP is configured.")
+    else:
+        lines.append("mail: log mode")
+    for guild in bot.guilds:
+        bot_member = guild.me or (guild.get_member(bot.user.id) if bot.user else None)
+        if bot_member is None:
+            lines.append(f"{guild.name}: WARN bot member not found")
+            continue
+        perms = bot_member.guild_permissions
+        missing = []
+        if not perms.send_messages:
+            missing.append("Send Messages")
+        if not perms.embed_links:
+            missing.append("Embed Links")
+        if not perms.read_message_history:
+            missing.append("Read Message History")
+        if not perms.manage_roles:
+            missing.append("Manage Roles")
+        lines.append(f"{guild.name}: {'OK permissions' if not missing else 'WARN missing ' + ', '.join(missing)}")
+    return lines
 
 
 def is_dm(ctx: commands.Context) -> bool:
@@ -341,6 +449,7 @@ async def ensure_bot_channel(
         "profile_id": "profile_channel_id",
         "review_id": "review_channel_id",
         "remind_id": "remind_channel_id",
+        "shop_id": "shop_channel_id",
     }
     configured_id = int(bot.kcfg.get(cfg_key_by_kv.get(kv_key3, ""), 0) or 0)
     channel = guild.get_channel(configured_id) if configured_id else None
@@ -407,6 +516,22 @@ async def ensure_profile_panel_message(channel: discord.TextChannel, report: lis
         report.append(t("setup_channels_pin_failed", current_lang(), error=exc))
 
 
+async def ensure_shop_panel_message(channel: discord.TextChannel, report: list[str]) -> None:
+    msg = "Kiri 写真商店\n选择商品查看内容、价格和购买方式。\n付款完成后由管理员确认，确认后会自动发送下载信息。"
+    panel_msg = None
+    panel_msg_id = kv_get("discord", "message", "shop_panel_id")
+    if panel_msg_id and str(panel_msg_id).isdigit():
+        try:
+            panel_msg = await channel.fetch_message(int(panel_msg_id))
+            await panel_msg.edit(content=msg, view=ShopPanelView(bot))
+        except Exception:
+            panel_msg = None
+    if panel_msg is None:
+        panel_msg = await channel.send(msg, view=ShopPanelView(bot))
+        kv_upsert("discord", "message", "shop_panel_id", str(panel_msg.id), "Auto setup shop panel message")
+    report.append(f"shop panel: {panel_msg.jump_url}")
+
+
 @bot.event
 async def on_ready():
     init_db()
@@ -414,11 +539,21 @@ async def on_ready():
 
     bot.add_view(PayPanelView(bot))
     bot.add_view(ProfilePanelView(bot))
+    bot.add_view(ShopPanelView(bot))
+    restored_review_views = 0
+    for order_id in list_product_order_ids_for_review_views():
+        bot.add_view(ProductReviewView(bot, order_id))
+        restored_review_views += 1
     bot.ensure_month_structure = ensure_month_structure
 
-    print(f"READY: {bot.user} ({bot.user.id})")
-    print("GUILDS:", [g.name for g in bot.guilds])
-    print("KCFG:", bot.kcfg)
+    logger.info("READY: %s (%s)", bot.user, bot.user.id)
+    logger.info("GUILDS: %s", [g.name for g in bot.guilds])
+    logger.info("RESTORED PRODUCT REVIEW VIEWS: %s", restored_review_views)
+    logger.info("KCFG: %s", {k: v for k, v in bot.kcfg.items() if "token" not in k.lower()})
+    check_lines = await startup_self_check()
+    for line in check_lines:
+        logger.info("[self-check] %s", line)
+    await send_bot_log("\n".join(check_lines))
     await ensure_year_structure(datetime.now(JST).year)
 
     if not year_structure_tick.is_running():
@@ -557,6 +692,15 @@ async def setup_channels(ctx: commands.Context):
             admin_role_ids=admin_role_ids,
             report=report,
         )
+        shop_channel = await ensure_bot_channel(
+            ctx.guild,
+            category,
+            name="shop",
+            kv_key3="shop_id",
+            public=True,
+            admin_role_ids=admin_role_ids,
+            report=report,
+        )
         await ensure_bot_channel(
             ctx.guild,
             category,
@@ -576,6 +720,7 @@ async def setup_channels(ctx: commands.Context):
             report=report,
         )
         await ensure_profile_panel_message(profile_channel, report)
+        await ensure_shop_panel_message(shop_channel, report)
 
     report.append(t("setup_channels_done", current_lang()))
     for chunk in split_discord_message("\n".join(report)):
@@ -623,6 +768,401 @@ async def profilepanel(ctx: commands.Context):
         await ctx.send(t("profilepanel_pin_failed", current_lang(), error=exc))
 
 
+@bot.command(name="shoppanel")
+async def shoppanel(ctx: commands.Context):
+    reload_kcfg()
+    admin_role_ids: set[int] = bot.kcfg.get("admin_role_ids", set())
+    if not isinstance(ctx.author, discord.Member) or not is_admin_member(ctx.author, admin_role_ids):
+        await ctx.reply(t("no_permission", current_lang()))
+        return
+    shop_channel_id = int(bot.kcfg.get("shop_channel_id", 0))
+    if shop_channel_id and ctx.channel and ctx.channel.id != shop_channel_id:
+        await ctx.reply(f"请在配置的 shop 频道执行：<#{shop_channel_id}>")
+        return
+    await ctx.send(
+        "Kiri 写真商店\n选择商品查看内容、价格和购买方式。\n付款完成后由管理员确认，确认后会自动发送下载信息。",
+        view=ShopPanelView(bot),
+    )
+
+
+@bot.command(name="product_create")
+async def product_create(
+    ctx: commands.Context,
+    product_id: str,
+    price_amount: int,
+    download_url: str,
+    *,
+    product_name: str,
+):
+    reload_kcfg()
+    admin_role_ids: set[int] = bot.kcfg.get("admin_role_ids", set())
+    if not isinstance(ctx.author, discord.Member) or not is_admin_member(ctx.author, admin_role_ids):
+        await ctx.reply(t("no_permission", current_lang()))
+        return
+    try:
+        pid = create_product(
+            product_id=product_id,
+            product_name=product_name,
+            price_amount=price_amount,
+            download_url=download_url,
+        )
+    except Exception as exc:
+        await ctx.reply(f"商品创建失败：{exc}")
+        return
+    logger.info("product created product_id=%s by=%s", pid, ctx.author.id)
+    await send_bot_log(f"product created: `{pid}` by <@{ctx.author.id}>")
+    await ctx.reply(f"商品已创建为 DRAFT：`{pid}`。使用 `!product_publish {pid}` 发布。")
+
+
+@bot.command(name="product_edit")
+async def product_edit(ctx: commands.Context, product_id: str, field: str, *, value: str):
+    reload_kcfg()
+    admin_role_ids: set[int] = bot.kcfg.get("admin_role_ids", set())
+    if not isinstance(ctx.author, discord.Member) or not is_admin_member(ctx.author, admin_role_ids):
+        await ctx.reply(t("no_permission", current_lang()))
+        return
+    try:
+        update_product_field(product_id, field, value)
+    except Exception as exc:
+        await ctx.reply(f"商品更新失败：{exc}")
+        return
+    logger.info("product updated product_id=%s field=%s by=%s", product_id.upper(), field, ctx.author.id)
+    await send_bot_log(f"product updated: `{product_id.upper()}` field `{field}` by <@{ctx.author.id}>")
+    await ctx.reply(f"商品 `{product_id.upper()}` 已更新字段 `{field}`。")
+
+
+@bot.command(name="product_publish")
+async def product_publish(ctx: commands.Context, product_id: str):
+    reload_kcfg()
+    admin_role_ids: set[int] = bot.kcfg.get("admin_role_ids", set())
+    if not isinstance(ctx.author, discord.Member) or not is_admin_member(ctx.author, admin_role_ids):
+        await ctx.reply(t("no_permission", current_lang()))
+        return
+    ok = set_product_status(product_id, "SALE")
+    if ok:
+        logger.info("product published product_id=%s by=%s", product_id.upper(), ctx.author.id)
+        await send_bot_log(f"product published: `{product_id.upper()}` by <@{ctx.author.id}>")
+    await ctx.reply("商品已发布。" if ok else "商品不存在。")
+
+
+@bot.command(name="product_stop")
+async def product_stop(ctx: commands.Context, product_id: str):
+    reload_kcfg()
+    admin_role_ids: set[int] = bot.kcfg.get("admin_role_ids", set())
+    if not isinstance(ctx.author, discord.Member) or not is_admin_member(ctx.author, admin_role_ids):
+        await ctx.reply(t("no_permission", current_lang()))
+        return
+    ok = set_product_status(product_id, "STOP")
+    if ok:
+        logger.info("product stopped product_id=%s by=%s", product_id.upper(), ctx.author.id)
+        await send_bot_log(f"product stopped: `{product_id.upper()}` by <@{ctx.author.id}>")
+    await ctx.reply("商品已停止销售。" if ok else "商品不存在。")
+
+
+@bot.command(name="product_list")
+async def product_list(ctx: commands.Context, status: str = None):
+    reload_kcfg()
+    admin_role_ids: set[int] = bot.kcfg.get("admin_role_ids", set())
+    if not isinstance(ctx.author, discord.Member) or not is_admin_member(ctx.author, admin_role_ids):
+        await ctx.reply(t("no_permission", current_lang()))
+        return
+    rows = list_products(status=status.upper() if status else None, limit=50)
+    if not rows:
+        await ctx.reply("没有商品。")
+        return
+    lines = [
+        f"`{r['product_id']}` {r['status']} {r['product_name']} {r['price_amount']}{r['price_currency']}"
+        for r in rows
+    ]
+    for chunk in split_discord_message("\n".join(lines)):
+        await ctx.send(chunk)
+
+
+@bot.command(name="product_show")
+async def product_show(ctx: commands.Context, product_id: str):
+    reload_kcfg()
+    admin_role_ids: set[int] = bot.kcfg.get("admin_role_ids", set())
+    if not isinstance(ctx.author, discord.Member) or not is_admin_member(ctx.author, admin_role_ids):
+        await ctx.reply(t("no_permission", current_lang()))
+        return
+    row = get_product(product_id)
+    if row is None:
+        await ctx.reply("商品不存在。")
+        return
+    lines = [
+        f"商品ID: {row['product_id']}",
+        f"名称: {row['product_name']}",
+        f"状态: {row['status']}",
+        f"类型: {row['product_type']}",
+        f"价格: {row['price_amount']} {row['price_currency']}",
+        f"说明: {row['description'] or '-'}",
+        f"下载链接: https://***",
+        f"密码: {'已设置' if row['download_password'] else '无'}",
+        f"文件大小: {row['file_size_label'] or '-'}",
+        f"内容数量: {row['content_count_label'] or '-'}",
+    ]
+    await ctx.reply("\n".join(lines))
+
+
+@bot.command(name="order_show")
+async def order_show(ctx: commands.Context, order_id: str):
+    reload_kcfg()
+    admin_role_ids: set[int] = bot.kcfg.get("admin_role_ids", set())
+    if not isinstance(ctx.author, discord.Member) or not is_admin_member(ctx.author, admin_role_ids):
+        await ctx.reply(t("no_permission", current_lang()))
+        return
+    row = get_order(order_id)
+    if row is None:
+        await ctx.reply("订单不存在。")
+        return
+    deliveries = list_order_deliveries(order_id)
+    lines = [
+        f"订单: {row['request_id']}",
+        f"类型: {row['purchase_type']}",
+        f"状态: {row['status']}",
+        f"商品: {row['product_name'] or row['product_id']}",
+        f"用户: <@{row['user_id']}> (`{row['user_id']}`)",
+        f"金额: {row['amount_expected']} {row['currency']}",
+        f"邮箱: ***",
+        f"交付次数: {len(deliveries)}",
+    ]
+    await ctx.reply("\n".join(lines))
+
+
+@bot.command(name="order_resend")
+async def order_resend(ctx: commands.Context, order_id: str):
+    reload_kcfg()
+    admin_role_ids: set[int] = bot.kcfg.get("admin_role_ids", set())
+    if not isinstance(ctx.author, discord.Member) or not is_admin_member(ctx.author, admin_role_ids):
+        await ctx.reply(t("no_permission", current_lang()))
+        return
+    row = get_order(order_id)
+    if row is None or row["purchase_type"] != "PRODUCT":
+        await ctx.reply("商品订单不存在。")
+        return
+    if row["status"] not in {"SENT", "DELIVERY_FAILED"}:
+        await ctx.reply(f"该订单当前不能重发：{row['status']}")
+        return
+    if not mark_order_delivery_pending(order_id):
+        await ctx.reply("无法进入重发状态，订单可能已被其他操作处理。")
+        return
+    async with ctx.typing():
+        row = get_order(order_id)
+        delivered = await deliver_product_order(row, bot=bot)
+    logger.info("order resend order_id=%s status=%s by=%s", order_id, "SENT" if delivered else "DELIVERY_FAILED", ctx.author.id)
+    await send_bot_log(f"order resend: `{order_id}` -> {'SENT' if delivered else 'DELIVERY_FAILED'} by <@{ctx.author.id}>")
+    await ctx.reply(f"重发完成，状态：{'SENT' if delivered else 'DELIVERY_FAILED'}。")
+
+
+@bot.command(name="feed_post")
+async def feed_post(ctx: commands.Context, title: str, original_url: str = None, *, body: str):
+    reload_kcfg()
+    if not command_is_admin(ctx):
+        await ctx.reply(t("no_permission", current_lang()))
+        return
+    try:
+        post_id = create_feed_post(title=title, body=body, original_url=original_url, created_by=ctx.author.id)
+    except Exception as exc:
+        await ctx.reply(f"动态发布失败：{exc}")
+        return
+    feed_channel_id = int(bot.kcfg.get("feed_channel_id", 0) or 0)
+    ch = bot.get_channel(feed_channel_id) if feed_channel_id else ctx.channel
+    if ch:
+        embed = discord.Embed(title=title, description=body[:1800])
+        if original_url:
+            embed.add_field(name="原文", value=original_url, inline=False)
+        await ch.send(embed=embed)
+    await send_bot_log(f"feed post: `{post_id}` by <@{ctx.author.id}>")
+    await ctx.reply(f"动态已发布：`{post_id}`")
+
+
+@bot.command(name="feed_list")
+async def feed_list(ctx: commands.Context, limit: int = 5):
+    rows = list_feed_posts(limit=max(1, min(limit, 20)))
+    if not rows:
+        await ctx.reply("暂无动态。")
+        return
+    await ctx.reply("\n".join(f"`{r['post_id']}` {r['title']} {r['created_at']}" for r in rows))
+
+
+@bot.command(name="poll_create")
+async def poll_create(ctx: commands.Context, visibility: str, title: str, *, options_text: str):
+    reload_kcfg()
+    if not command_is_admin(ctx):
+        await ctx.reply(t("no_permission", current_lang()))
+        return
+    options = [part.strip() for part in options_text.split("|")]
+    try:
+        poll_id = create_poll(title=title, options=options, created_by=ctx.author.id, visibility=visibility.upper())
+    except Exception as exc:
+        await ctx.reply(f"投票创建失败：{exc}")
+        return
+    lines = [f"投票 `{poll_id}`：{title}"]
+    lines.extend(f"{idx + 1}. {label}" for idx, label in enumerate(options) if label)
+    lines.append(f"使用 `!poll_vote {poll_id} <编号>` 投票。")
+    await ctx.send("\n".join(lines))
+
+
+@bot.command(name="poll_vote")
+async def poll_vote_cmd(ctx: commands.Context, poll_id: str, option_index: int):
+    reload_kcfg()
+    poll = get_poll(poll_id)
+    if poll is not None and poll["visibility"] == "BUYER":
+        if not isinstance(ctx.author, discord.Member) or not member_is_buyer(ctx.author):
+            await ctx.reply("这个投票仅限 Buyer 参加。")
+            return
+    try:
+        vote_poll(poll_id, ctx.author.id, option_index)
+    except Exception as exc:
+        await ctx.reply(f"投票失败：{exc}")
+        return
+    await ctx.reply("投票已记录。")
+
+
+@bot.command(name="poll_close")
+async def poll_close_cmd(ctx: commands.Context, poll_id: str):
+    reload_kcfg()
+    if not command_is_admin(ctx):
+        await ctx.reply(t("no_permission", current_lang()))
+        return
+    await ctx.reply("投票已关闭。" if close_poll(poll_id) else "投票不存在或已关闭。")
+
+
+@bot.command(name="poll_result")
+async def poll_result_cmd(ctx: commands.Context, poll_id: str):
+    rows = poll_results(poll_id)
+    if not rows:
+        await ctx.reply("没有投票结果。")
+        return
+    await ctx.reply("\n".join(f"{r['option_index']}. {r['label']}: {r['votes']}" for r in rows))
+
+
+@bot.command(name="question")
+async def question_cmd(ctx: commands.Context, anonymous: str = "no", *, body: str):
+    qid = create_question(ctx.author.id, body, is_anonymous=anonymous.lower() in {"yes", "1", "true", "anon", "anonymous"})
+    question_channel_id = int(bot.kcfg.get("question_channel_id", 0) or 0)
+    ch = bot.get_channel(question_channel_id) if question_channel_id else None
+    if ch:
+        author = "匿名" if anonymous.lower() in {"yes", "1", "true", "anon", "anonymous"} else f"<@{ctx.author.id}>"
+        await ch.send(f"问题 `{qid}` from {author}\n{body[:1500]}")
+    await ctx.reply(f"问题已提交：`{qid}`")
+
+
+@bot.command(name="question_list")
+async def question_list_cmd(ctx: commands.Context, status: str = "OPEN"):
+    reload_kcfg()
+    if not command_is_admin(ctx):
+        await ctx.reply(t("no_permission", current_lang()))
+        return
+    rows = list_questions(status=status.upper(), limit=20)
+    if not rows:
+        await ctx.reply("没有问题。")
+        return
+    await ctx.reply("\n".join(f"`{r['question_id']}` {r['status']} {r['body'][:80]}" for r in rows))
+
+
+@bot.command(name="question_answer")
+async def question_answer_cmd(ctx: commands.Context, question_id: str, *, answer: str):
+    reload_kcfg()
+    if not command_is_admin(ctx):
+        await ctx.reply(t("no_permission", current_lang()))
+        return
+    ok = answer_question(question_id, answer, ctx.author.id)
+    await ctx.reply("问题已回答。" if ok else "问题不存在或已处理。")
+
+
+@bot.command(name="event_create")
+async def event_create_cmd(ctx: commands.Context, starts_at: str, buyer_only: str, title: str, *, description: str = ""):
+    reload_kcfg()
+    if not command_is_admin(ctx):
+        await ctx.reply(t("no_permission", current_lang()))
+        return
+    event_id = create_club_event(
+        title=title,
+        starts_at=starts_at,
+        created_by=ctx.author.id,
+        description=description,
+        buyer_only=buyer_only.lower() in {"1", "true", "yes", "buyer"},
+    )
+    event_channel_id = int(bot.kcfg.get("event_channel_id", 0) or 0)
+    ch = bot.get_channel(event_channel_id) if event_channel_id else ctx.channel
+    if ch:
+        await ch.send(f"活动 `{event_id}`：{title}\n时间：{starts_at}\n使用 `!event_join {event_id}` 报名。")
+    await ctx.reply(f"活动已创建：`{event_id}`")
+
+
+@bot.command(name="event_join")
+async def event_join_cmd(ctx: commands.Context, event_id: str):
+    reload_kcfg()
+    event = get_club_event(event_id)
+    if event is not None and int(event["buyer_only"]) == 1:
+        if not isinstance(ctx.author, discord.Member) or not member_is_buyer(ctx.author):
+            await ctx.reply("这个活动仅限 Buyer 报名。")
+            return
+    try:
+        join_club_event(event_id, ctx.author.id)
+    except Exception as exc:
+        await ctx.reply(f"报名失败：{exc}")
+        return
+    await ctx.reply("报名已记录。")
+
+
+@bot.command(name="event_list")
+async def event_list_cmd(ctx: commands.Context):
+    rows = list_club_events()
+    if not rows:
+        await ctx.reply("暂无活动。")
+        return
+    await ctx.reply("\n".join(f"`{r['event_id']}` {r['starts_at']} {r['title']} joined={r['joined_count']}" for r in rows))
+
+
+@bot.command(name="supporter_set")
+async def supporter_set_cmd(ctx: commands.Context, member: discord.Member, level_name: str, *, benefits: str = ""):
+    reload_kcfg()
+    if not command_is_admin(ctx):
+        await ctx.reply(t("no_permission", current_lang()))
+        return
+    set_supporter_level(member.id, level_name, benefits, ctx.author.id)
+    await ctx.reply(f"已设置 {member.mention} 的支持者等级：{level_name}")
+
+
+@bot.command(name="submission_add")
+async def submission_add_cmd(ctx: commands.Context, title: str, url: str = None, *, note: str = ""):
+    try:
+        sid = create_fan_submission(ctx.author.id, title, url=url, note=note)
+    except Exception as exc:
+        await ctx.reply(f"投稿失败：{exc}")
+        return
+    await ctx.reply(f"投稿已提交：`{sid}`")
+
+
+@bot.command(name="submission_pick")
+async def submission_pick_cmd(ctx: commands.Context, submission_id: str, yyyymm: str):
+    reload_kcfg()
+    if not command_is_admin(ctx):
+        await ctx.reply(t("no_permission", current_lang()))
+        return
+    try:
+        ok = pick_fan_submission(submission_id, yyyymm)
+    except Exception as exc:
+        await ctx.reply(f"精选失败：{exc}")
+        return
+    await ctx.reply("已设为月度精选。" if ok else "投稿不存在。")
+
+
+@bot.command(name="export_products_json")
+async def export_products_json_cmd(ctx: commands.Context, path: str = "public-products.json"):
+    reload_kcfg()
+    if not command_is_admin(ctx):
+        await ctx.reply(t("no_permission", current_lang()))
+        return
+    if os.path.isabs(path) or ".." in path.split(os.sep):
+        await ctx.reply("导出路径必须是项目内相对路径。")
+        return
+    count = export_public_products_json(path)
+    await ctx.reply(f"已导出 {count} 个公开商品到 `{path}`。")
+
+
 @bot.command(name="sync_roles")
 async def sync_roles_cmd(ctx: commands.Context):
     reload_kcfg()
@@ -650,6 +1190,8 @@ async def setpaypay(ctx: commands.Context, url: str, *, expires: str = None):
         return
 
     link_id = set_paypay_link(url=url, created_by=ctx.author.id, expires_at=expires)
+    kv_upsert("billing", "global", "paypay_url", url, "PayPay URL for product purchases")
+    reload_kcfg()
     await ctx.reply(t("paypay_updated", current_lang(), link_id=link_id))
 
 

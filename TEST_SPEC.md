@@ -13,6 +13,9 @@
 - 每年/月 Role 和 Channel 的自动创建与权限修复
 - `!sync_roles` 对账补角色
 - 定时任务基础行为
+- P0 商品商店、商品订单、邮件交付与我的写真集
+- P1/P2 社区功能：动态、投票、提问箱、活动、支持者等级、粉丝投稿
+- HP 最小联动页面和公开商品 JSON
 
 ## 2. 测试环境
 
@@ -48,6 +51,10 @@ python main.py
   - `#review`
   - `#remind`
   - `#pay`
+  - `#shop`
+  - `#kiri-feed`
+  - `#questions`
+  - `#events`
 
 Bot 权限需要：
 
@@ -117,10 +124,19 @@ Bot 权限需要：
 !kvs <password> discord channel profile_id <profile频道ID>
 !kvs <password> discord channel review_id <review频道ID>
 !kvs <password> discord channel remind_id <remind频道ID>
+!kvs <password> discord channel shop_id <shop频道ID>
+!kvs <password> discord channel feed_id <kiri-feed频道ID>
+!kvs <password> discord channel question_id <questions频道ID>
+!kvs <password> discord channel event_id <events频道ID>
+!kvs <password> discord channel bot_log_id <bot-log频道ID>
+!kvs <password> discord role buyer_id <Buyer角色ID>
 !kvs <password> billing global month_price_label 1000円
+!kvs <password> billing global paypay_url https://example.com/paypay-test
 !kvs <password> reminder global expiry_days 5
 !kvs <password> reminder global scan_hours 12
 !kvs <password> reminder global sync_enabled 1
+!kvs <password> delivery global self_service_cooldown_minutes 60
+!kvs <password> delivery global max_retry_count 3
 ```
 
 确认命令：
@@ -193,6 +209,21 @@ Bot 权限需要：
 21. TC-020 管理员审核拒绝
 22. TC-023 sync_roles 定时任务开关
 23. TC-024 到期提醒任务
+24. TC-025 商品创建、编辑、发布
+25. TC-026 shop 面板与商品详情
+26. TC-027 商品购买申请与重复待审核拦截
+27. TC-028 商品订单批准、邮件 log 交付、我的写真集
+28. TC-029 商品订单拒绝
+29. TC-030 商品停售后新购拦截、既有订单可审
+30. TC-031 用户自助重发与管理员强制重发
+31. TC-032 动态 feed 手动发布与去重记录
+32. TC-033 投票创建、投票、关闭和结果
+33. TC-034 提问箱提交、列表和回答
+34. TC-035 活动创建、报名和 Buyer-only 限制
+35. TC-036 支持者等级设置
+36. TC-037 粉丝投稿和月度精选
+37. TC-038 公开商品 JSON 导出不含敏感字段
+38. TC-039 HP 页面和公开商品 JSON
 
 ### TC-001 Bot 启动与 DB 初始化
 
@@ -768,6 +799,244 @@ python -c "import sqlite3, datetime; c=sqlite3.connect('bot.db'); c.execute('ins
 
 - Bot 在提醒频道发送即将到期提醒
 
+### TC-025 商品创建、编辑、发布
+
+步骤：
+
+```text
+!product_create KIRI-TEST 2000 https://example.com/download Kiri Test Product
+!product_edit KIRI-TEST description 测试商品说明
+!product_edit KIRI-TEST file_size_label 1.8GB
+!product_edit KIRI-TEST content_count_label 写真120张
+!product_publish KIRI-TEST
+!product_list SALE
+!product_show KIRI-TEST
+```
+
+预期结果：
+
+- 商品默认 DRAFT，发布后为 SALE。
+- `!product_show` 不显示真实下载链接和密码。
+- SQL 中 `product_T.status='SALE'`。
+
+### TC-026 shop 面板与商品详情
+
+步骤：
+
+1. 管理员在 `#shop` 执行 `!shoppanel`。
+2. 普通用户打开商品选择菜单。
+3. 选择 `KIRI-TEST`。
+
+预期结果：
+
+- 只显示 SALE 商品。
+- 商品详情包含名称、类型、价格、简介、数量、文件大小、购买按钮。
+- 不显示 `download_url` 和 `download_password`。
+
+### TC-027 商品购买申请与重复待审核拦截
+
+步骤：
+
+1. 用户点击商品详情的 `购买`。
+2. 确认 PayPay 链接为 KVS 的 `billing/global/paypay_url`。
+3. 点击 `已付款`，填写 PayPay 名、邮箱和备注。
+4. 再次对同一商品提交购买。
+
+预期结果：
+
+- 第一次创建 `PRODUCT` / `PENDING` 订单。
+- 审核频道出现商品订单审核卡片。
+- 第二次被提示已有待审核订单编号。
+
+### TC-028 商品订单批准、邮件 log 交付、我的写真集
+
+步骤：
+
+1. 管理员点击商品订单 `批准`。
+2. 检查用户是否获得 `buyer_id`，未设置时 fallback 到 `paid_id`。
+3. 检查订单状态。
+4. 用户打开 Profile 面板，点击 `我的写真集`。
+
+预期结果：
+
+- 订单状态进入 `SENT`。
+- `delivery_T` 写入一条 `EMAIL` / `SENT` 记录。
+- `MAIL_MODE=log` 不发送真实邮件，结果为 simulated。
+- 用户可看到下载链接和密码；其他用户不能看到。
+
+### TC-029 商品订单拒绝
+
+步骤：
+
+1. 用户重新提交一个商品订单。
+2. 管理员点击 `拒绝`。
+3. 在 Modal 中输入拒绝理由。
+
+预期结果：
+
+- 订单状态为 `REJECTED`。
+- 保存 `rejected_by`, `rejected_at`, `reject_reason`。
+- 不发送交付，不赋予 Buyer Role。
+
+### TC-030 商品停售后新购拦截、既有订单可审
+
+步骤：
+
+1. 用户 A 创建一条商品 PENDING 订单。
+2. 管理员执行 `!product_stop KIRI-TEST`。
+3. 用户 B 尝试新购。
+4. 管理员批准用户 A 的既有订单。
+
+预期结果：
+
+- 用户 B 新购被拦截。
+- 用户 A 既有订单仍可批准和交付。
+
+### TC-031 用户自助重发与管理员强制重发
+
+步骤：
+
+1. 用户在 `我的写真集` 点击 `重新发送到邮箱`。
+2. 冷却时间内再次点击。
+3. 管理员执行 `!order_resend <order_id>`。
+
+预期结果：
+
+- 首次重发写入新的 `delivery_T`。
+- 冷却时间内提示稍后再试。
+- 管理员强制重发不受用户冷却限制。
+
+### TC-032 动态 feed 手动发布与去重记录
+
+步骤：
+
+```text
+!feed_post KiriNews https://example.com/post 今天的 Kiri 动态正文
+!feed_list 5
+```
+
+预期结果：
+
+- `#kiri-feed` 或当前频道出现动态 Embed。
+- `feed_post_T` 保存记录。
+- 不需要 X API；X 自动同步仍作为外部集成后续接入点。
+
+### TC-033 投票创建、投票、关闭和结果
+
+步骤：
+
+```text
+!poll_create PUBLIC CoverVote A|B|C
+!poll_vote <poll_id> 1
+!poll_result <poll_id>
+!poll_close <poll_id>
+```
+
+预期结果：
+
+- 投票和选项写入 DB。
+- 同一用户再次投票会覆盖自己的选择。
+- 关闭后不能继续投票。
+
+### TC-034 提问箱提交、列表和回答
+
+步骤：
+
+```text
+!question anonymous 想问的问题
+!question_list OPEN
+!question_answer <question_id> 回答内容
+```
+
+预期结果：
+
+- 匿名问题在频道中不显示提交者。
+- 管理员可回答，状态变为 `ANSWERED`。
+
+### TC-035 活动创建、报名和 Buyer-only 限制
+
+步骤：
+
+```text
+!event_create 2026-08-20T10:00:00Z no KiriStage 活动说明
+!event_join <event_id>
+!event_list
+!event_create 2026-08-21T10:00:00Z buyer BuyerOnly 活动说明
+```
+
+预期结果：
+
+- 普通活动所有成员可报名。
+- Buyer-only 活动只有拥有 `buyer_id` 或 fallback `paid_id` 的成员可报名。
+
+### TC-036 支持者等级设置
+
+步骤：
+
+```text
+!supporter_set @用户 Gold priority delivery
+```
+
+预期结果：
+
+- `supporter_level_T` 写入或更新该用户等级。
+- 只有管理员可执行。
+
+### TC-037 粉丝投稿和月度精选
+
+步骤：
+
+```text
+!submission_add FanArt https://example.com/art 投稿说明
+!submission_pick <submission_id> 202608
+```
+
+预期结果：
+
+- 投稿保存为 `SUBMITTED`。
+- 管理员可设为 `PICKED` 并保存月份。
+
+### TC-038 公开商品 JSON 导出不含敏感字段
+
+步骤：
+
+```text
+!export_products_json public-products.json
+```
+
+预期结果：
+
+- JSON 中包含商品公开字段。
+- JSON 不包含 `download_url`, `download_password`, 用户、订单、付款信息。
+
+### TC-039 HP 页面和公开商品 JSON
+
+步骤：
+
+1. 进入 `kiri-homepage`。
+2. 执行：
+
+```powershell
+npm install
+npm run lint
+npm run build
+```
+
+3. 打开：
+   - `/zh/about`
+   - `/zh/universe`
+   - `/zh/products`
+   - `/zh/products/KIRI-2026-08`
+   - `/zh/faq`
+   - `/zh/community`
+   - `/products.json`
+
+预期结果：
+
+- 页面可构建。
+- 产品页显示封面、简介、价格、数量、文件大小、预览图和 Discord 购买入口。
+- 前端公开数据不包含下载链接和密码。
+
 ## 6. 回归测试清单
 
 每次改代码后至少确认：
@@ -782,6 +1051,9 @@ python -c "import sqlite3, datetime; c=sqlite3.connect('bot.db'); c.execute('ins
 - 审核通过会添加 `Paid_YYYY_MM`
 - `!sync_roles` 能补齐缺失角色
 - 重启 Bot 不重复创建 Role/Channel
+- `!shoppanel`、`!product_*`、`!order_resend` 可用
+- `!feed_post`、`!poll_*`、`!question_*`、`!event_*`、`!supporter_set`、`!submission_*` 可用
+- HP 最小联动页面可构建
 
 ## 7. 常见失败与确认点
 
@@ -827,7 +1099,7 @@ python -c "import sqlite3, datetime; c=sqlite3.connect('bot.db'); c.execute('ins
 
 满足以下条件可判定测试通过：
 
-- 所有 P0/P1 测试用例通过
+- 所有 P0/P1/P2/P3 可本地闭环测试用例通过
 - 没有 Python 语法错误
 - 没有 Discord 权限导致的未处理异常
 - 数据库 `user_T` 和 `entitlement_T` 数据符合预期

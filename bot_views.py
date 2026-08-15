@@ -3,8 +3,10 @@ from discord.ext import commands
 from datetime import timezone
 from typing import Optional
 import calendar
+import logging
 
 from config import JST
+from mail_service import mask_email, send_delivery_email
 from storage_sqlite import (
     has_pending_request,
     create_request,
@@ -18,8 +20,24 @@ from storage_sqlite import (
     set_user_paid_status,
     months_covered,
     upsert_month_entitlements,
+    list_products,
+    get_product,
+    create_product_order,
+    has_pending_product_order,
+    get_order,
+    approve_product_order,
+    set_order_delivery_status,
+    reject_product_order,
+    create_delivery_record,
+    list_order_deliveries,
+    list_user_orders,
+    list_user_purchased_products,
+    get_latest_sent_order_for_product,
 )
 from i18n import t
+
+
+logger = logging.getLogger(__name__)
 
 
 def bot_lang(bot: commands.Bot) -> str:
@@ -44,6 +62,358 @@ def is_valid_birthday_mmdd(value: str) -> bool:
     if d < 1 or d > calendar.monthrange(2000, m)[1]:
         return False
     return True
+
+
+def product_price(row) -> str:
+    return f"{row['price_amount']} {row['price_currency'] or 'JPY'}"
+
+
+async def send_operational_log(bot: commands.Bot, message: str) -> None:
+    channel_id = int(getattr(bot, "kcfg", {}).get("bot_log_channel_id", 0) or 0)
+    if not channel_id:
+        return
+    ch = bot.get_channel(channel_id)
+    if ch is None:
+        return
+    try:
+        await ch.send(message[:1900])
+    except Exception as exc:
+        logger.warning("failed to send operational log: %s", exc)
+
+
+def product_public_embed(row) -> discord.Embed:
+    embed = discord.Embed(
+        title=row["product_name"],
+        description=row["description"] or "説明は未設定です。",
+    )
+    embed.add_field(name="商品ID", value=row["product_id"], inline=True)
+    embed.add_field(name="種類", value=row["product_type"], inline=True)
+    embed.add_field(name="価格", value=product_price(row), inline=True)
+    embed.add_field(name="内容", value=row["content_count_label"] or "未設定", inline=True)
+    embed.add_field(name="サイズ", value=row["file_size_label"] or "未設定", inline=True)
+    if row["cover_url"]:
+        embed.set_image(url=row["cover_url"])
+    if row["preview_url"]:
+        embed.add_field(name="Preview", value=row["preview_url"], inline=False)
+    return embed
+
+
+async def deliver_product_order(order, *, bot: commands.Bot) -> bool:
+    result = send_delivery_email(
+        to_email=order["email"],
+        display_name=order["paypay_name"],
+        product_name=order["product_name"] or order["product_id"],
+        download_url=order["download_url"],
+        download_password=order["download_password"],
+        file_size_label=order["file_size_label"],
+        order_id=order["request_id"],
+    )
+    create_delivery_record(
+        order_id=order["request_id"],
+        channel="EMAIL",
+        destination_masked=mask_email(order["email"]),
+        status="SENT" if result.ok else "FAILED",
+        error_code=result.error_code,
+        error_message=result.error_message,
+    )
+    set_order_delivery_status(order["request_id"], "SENT" if result.ok else "DELIVERY_FAILED")
+    logger.info(
+        "delivery finished order_id=%s status=%s to=%s",
+        order["request_id"],
+        "SENT" if result.ok else "DELIVERY_FAILED",
+        mask_email(order["email"]),
+    )
+    await send_operational_log(
+        bot,
+        f"delivery: `{order['request_id']}` -> {'SENT' if result.ok else 'DELIVERY_FAILED'} to {mask_email(order['email'])}",
+    )
+    return result.ok
+
+
+class ProductPaidModal(discord.ui.Modal):
+    paypay_name = discord.ui.TextInput(
+        label="PayPay 表示名",
+        placeholder="例：Taro Yamada",
+        required=True,
+        min_length=1,
+        max_length=100,
+    )
+    email = discord.ui.TextInput(
+        label="接收邮箱",
+        placeholder="name@example.com",
+        required=True,
+        max_length=254,
+    )
+    payment_note = discord.ui.TextInput(
+        label="付款备注（选填）",
+        placeholder="付款时间、补充信息等",
+        required=False,
+        max_length=300,
+    )
+
+    def __init__(self, bot: commands.Bot, product_id: str):
+        super().__init__(title="提交商品付款信息", timeout=180)
+        self.bot = bot
+        self.product_id = product_id
+
+    async def on_submit(self, interaction: discord.Interaction):
+        if interaction.guild_id is None:
+            await interaction.response.send_message("请在服务器内提交购买申请。", ephemeral=True)
+            return
+        try:
+            order_id = create_product_order(
+                guild_id=interaction.guild_id,
+                user_id=interaction.user.id,
+                product_id=self.product_id,
+                email=str(self.email.value),
+                paypay_name=str(self.paypay_name.value).strip(),
+                payment_note=str(self.payment_note.value).strip() if self.payment_note.value else None,
+            )
+        except ValueError as exc:
+            await interaction.response.send_message(f"无法提交订单：{exc}", ephemeral=True)
+            return
+
+        order = get_order(order_id)
+        review_channel_id = int(self.bot.kcfg.get("review_channel_id", 0))
+        review_ch = self.bot.get_channel(review_channel_id)
+        if review_ch is None:
+            await interaction.response.send_message(
+                f"订单已创建（{order_id}），但审核频道未配置。请联系管理员。",
+                ephemeral=True,
+            )
+            return
+
+        embed = product_order_review_embed(order, interaction.user)
+        await review_ch.send(embed=embed, view=ProductReviewView(self.bot, order_id))
+        logger.info("product order created order_id=%s product_id=%s user_id=%s email=%s", order_id, self.product_id, interaction.user.id, mask_email(str(self.email.value)))
+        await send_operational_log(self.bot, f"order created: `{order_id}` product `{self.product_id}` user <@{interaction.user.id}> email {mask_email(str(self.email.value))}")
+        await interaction.response.send_message(f"已提交审核。订单编号：`{order_id}`", ephemeral=True)
+
+
+class ProductPurchaseView(discord.ui.View):
+    def __init__(self, bot: commands.Bot, product_id: str):
+        super().__init__(timeout=300)
+        self.bot = bot
+        self.product_id = product_id
+
+    @discord.ui.button(label="购买", style=discord.ButtonStyle.success)
+    async def buy(self, interaction: discord.Interaction, button: discord.ui.Button):
+        product = get_product(self.product_id)
+        if product is None or product["status"] != "SALE":
+            await interaction.response.send_message("该商品当前不在销售中。", ephemeral=True)
+            return
+        pending = has_pending_product_order(interaction.user.id, self.product_id)
+        if pending:
+            await interaction.response.send_message(f"你已有待审核订单：`{pending}`", ephemeral=True)
+            return
+        paypay_url = self.bot.kcfg.get("paypay_url") or get_active_paypay_link()[0]
+        if not paypay_url:
+            await interaction.response.send_message("当前没有可用的 PayPay 链接，请联系管理员。", ephemeral=True)
+            return
+        msg = (
+            f"商品：{product['product_name']}\n"
+            f"金额：{product['price_amount']}円\n\n"
+            f"请通过以下 PayPay 链接付款：\n{paypay_url}\n\n"
+            "付款后点击下面的“已付款”，填写付款名和接收邮箱。"
+        )
+        await interaction.response.send_message(msg, view=ProductPaymentStartView(self.bot, self.product_id), ephemeral=True)
+
+    @discord.ui.button(label="返回商店", style=discord.ButtonStyle.secondary)
+    async def back(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.edit_message(content="Kiri 写真商店", embed=None, view=ShopPanelView(self.bot))
+
+
+class ProductPaymentStartView(discord.ui.View):
+    def __init__(self, bot: commands.Bot, product_id: str):
+        super().__init__(timeout=300)
+        self.bot = bot
+        self.product_id = product_id
+
+    @discord.ui.button(label="已付款", style=discord.ButtonStyle.primary)
+    async def paid(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.send_modal(ProductPaidModal(self.bot, self.product_id))
+
+
+class ProductSelect(discord.ui.Select):
+    def __init__(self, bot: commands.Bot):
+        self.bot = bot
+        limit = int(bot.kcfg.get("max_products_per_page", 25))
+        products = list_products(status="SALE", limit=max(1, min(limit, 25)))
+        options = [
+            discord.SelectOption(
+                label=f"{row['product_name']}｜{row['price_amount']}円"[:100],
+                value=row["product_id"],
+                description=(row["description"] or row["product_id"])[:100],
+            )
+            for row in products
+        ]
+        if not options:
+            options = [discord.SelectOption(label="販売中の商品がありません", value="__none__")]
+        super().__init__(placeholder="商品を選択", min_values=1, max_values=1, options=options, custom_id="shop:select")
+
+    async def callback(self, interaction: discord.Interaction):
+        product_id = self.values[0]
+        if product_id == "__none__":
+            await interaction.response.send_message("現在販売中の商品はありません。", ephemeral=True)
+            return
+        product = get_product(product_id)
+        if product is None or product["status"] != "SALE":
+            await interaction.response.send_message("该商品当前不可购买。", ephemeral=True)
+            return
+        await interaction.response.send_message(
+            embed=product_public_embed(product),
+            view=ProductPurchaseView(self.bot, product_id),
+            ephemeral=True,
+        )
+
+
+class ShopPanelView(discord.ui.View):
+    def __init__(self, bot: commands.Bot):
+        super().__init__(timeout=None)
+        self.bot = bot
+        self.add_item(ProductSelect(bot))
+
+
+def product_order_review_embed(order, user=None) -> discord.Embed:
+    embed = discord.Embed(title="商品订单审核", description="用户提交了商品付款信息，请管理员确认。")
+    user_text = f"<@{order['user_id']}> (`{order['user_id']}`)" if user is None else f"{user.mention} (`{user.id}`)"
+    embed.add_field(name="订单编号", value=order["request_id"], inline=False)
+    embed.add_field(name="商品", value=f"{order['product_name']} / `{order['product_id']}`", inline=False)
+    embed.add_field(name="应付金额", value=f"{order['amount_expected']} {order['currency']}", inline=True)
+    embed.add_field(name="用户", value=user_text, inline=False)
+    embed.add_field(name="PayPay 显示名", value=order["paypay_name"], inline=True)
+    embed.add_field(name="邮箱", value=mask_email(order["email"]), inline=True)
+    embed.add_field(name="付款备注", value=order["payment_note"] or "无", inline=False)
+    embed.add_field(name="申请时间", value=order["requested_at"], inline=True)
+    embed.add_field(name="当前状态", value=order["status"], inline=True)
+    return embed
+
+
+class RejectProductOrderModal(discord.ui.Modal):
+    reason = discord.ui.TextInput(label="拒绝理由", required=True, max_length=300)
+
+    def __init__(self, bot: commands.Bot, order_id: str, parent_view: discord.ui.View, source_message):
+        super().__init__(title="拒绝商品订单", timeout=180)
+        self.bot = bot
+        self.order_id = order_id
+        self.parent_view = parent_view
+        self.source_message = source_message
+
+    async def on_submit(self, interaction: discord.Interaction):
+        ok = reject_product_order(self.order_id, interaction.user.id, str(self.reason.value))
+        if not ok:
+            await interaction.response.send_message("操作失败，订单可能已被处理。", ephemeral=True)
+            return
+        for child in self.parent_view.children:
+            if isinstance(child, discord.ui.Button):
+                child.disabled = True
+        if self.source_message is not None:
+            await self.source_message.edit(view=self.parent_view)
+        logger.info("product order rejected order_id=%s by=%s", self.order_id, interaction.user.id)
+        await send_operational_log(self.bot, f"order rejected: `{self.order_id}` by <@{interaction.user.id}>")
+        await interaction.response.send_message("已拒绝该商品订单。", ephemeral=True)
+        order = get_order(self.order_id)
+        if interaction.guild and order:
+            member = interaction.guild.get_member(int(order["user_id"]))
+            if member:
+                try:
+                    await member.send(f"你的商品订单 `{self.order_id}` 未通过审核。理由：{self.reason.value}")
+                except Exception:
+                    pass
+
+
+class ProductReviewView(discord.ui.View):
+    def __init__(self, bot: commands.Bot, order_id: str):
+        super().__init__(timeout=None)
+        self.bot = bot
+        self.order_id = order_id
+        self.approve.custom_id = f"product_order:approve:{order_id}"
+        self.reject.custom_id = f"product_order:reject:{order_id}"
+        self.deliveries.custom_id = f"product_order:deliveries:{order_id}"
+
+    async def _require_admin(self, interaction: discord.Interaction) -> bool:
+        admin_role_ids: set[int] = self.bot.kcfg.get("admin_role_ids", set())
+        if not isinstance(interaction.user, discord.Member) or not is_admin_member(interaction.user, admin_role_ids):
+            await interaction.response.send_message(t("no_permission", bot_lang(self.bot)), ephemeral=True)
+            return False
+        return True
+
+    @discord.ui.button(label="批准", style=discord.ButtonStyle.success)
+    async def approve(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if not await self._require_admin(interaction):
+            return
+        order = get_order(self.order_id)
+        if order is None:
+            await interaction.response.send_message("订单不存在。", ephemeral=True)
+            return
+        if order["status"] != "PENDING":
+            await interaction.response.send_message(f"该订单已处理：{order['status']}", ephemeral=True)
+            return
+        await interaction.response.defer(ephemeral=True)
+        ok = approve_product_order(self.order_id, interaction.user.id)
+        if not ok:
+            await interaction.followup.send("操作失败，订单可能已被其他管理员处理。", ephemeral=True)
+            return
+
+        guild = interaction.guild
+        member = guild.get_member(int(order["user_id"])) if guild else None
+        role_warning = ""
+        if guild and member:
+            role_id = int(self.bot.kcfg.get("buyer_role_id", 0) or self.bot.kcfg.get("paid_role_id", 0) or 0)
+            role = guild.get_role(role_id) if role_id else None
+            if role:
+                try:
+                    await member.add_roles(role, reason=f"Product order approved ({self.order_id})")
+                except Exception as exc:
+                    role_warning = f"\nBuyer/Paid Role 赋予失败：{exc}"
+            else:
+                role_warning = "\n未配置 buyer_id/paid_id，已跳过 Role 赋予。"
+
+        order = get_order(self.order_id)
+        delivered = await deliver_product_order(order, bot=self.bot)
+        for child in self.children:
+            if isinstance(child, discord.ui.Button) and child.label in {"批准", "拒绝"}:
+                child.disabled = True
+        latest = get_order(self.order_id)
+        await interaction.message.edit(embed=product_order_review_embed(latest), view=self)
+        await interaction.followup.send(
+            f"订单已批准，交付状态：{'SENT' if delivered else 'DELIVERY_FAILED'}。{role_warning}",
+            ephemeral=True,
+        )
+        logger.info("product order approved order_id=%s delivery=%s by=%s", self.order_id, "SENT" if delivered else "DELIVERY_FAILED", interaction.user.id)
+        await send_operational_log(self.bot, f"order approved: `{self.order_id}` delivery {'SENT' if delivered else 'DELIVERY_FAILED'} by <@{interaction.user.id}>")
+        if member:
+            try:
+                await member.send(f"你的商品订单 `{self.order_id}` 已审核通过。交付状态：{'已发送' if delivered else '发送失败，请联系管理员或稍后重试'}。")
+            except Exception:
+                pass
+
+    @discord.ui.button(label="拒绝", style=discord.ButtonStyle.danger)
+    async def reject(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if not await self._require_admin(interaction):
+            return
+        order = get_order(self.order_id)
+        if order is None:
+            await interaction.response.send_message("订单不存在。", ephemeral=True)
+            return
+        if order["status"] != "PENDING":
+            await interaction.response.send_message(f"该订单已处理：{order['status']}", ephemeral=True)
+            return
+        await interaction.response.send_modal(RejectProductOrderModal(self.bot, self.order_id, self, interaction.message))
+
+    @discord.ui.button(label="查看交付记录", style=discord.ButtonStyle.secondary)
+    async def deliveries(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if not await self._require_admin(interaction):
+            return
+        rows = list_order_deliveries(self.order_id)
+        if not rows:
+            await interaction.response.send_message("暂无交付记录。", ephemeral=True)
+            return
+        lines = [
+            f"{r['attempted_at']} #{r['attempt_count']} {r['channel']} {r['status']} {r['destination_masked'] or ''} {r['error_code'] or ''}"
+            for r in rows[:10]
+        ]
+        await interaction.response.send_message("\n".join(lines), ephemeral=True)
 
 
 class PayModal(discord.ui.Modal):
@@ -458,3 +828,116 @@ class ProfilePanelView(discord.ui.View):
     )
     async def edit_my_profile(self, interaction: discord.Interaction, button: discord.ui.Button):
         await interaction.response.send_modal(ProfileModal(target_user_id=interaction.user.id, lang=bot_lang(self.bot)))
+
+    @discord.ui.button(
+        label="我的写真集",
+        style=discord.ButtonStyle.success,
+        custom_id="profile:me:library",
+    )
+    async def my_library(self, interaction: discord.Interaction, button: discord.ui.Button):
+        rows = list_user_purchased_products(interaction.user.id)
+        if not rows:
+            await interaction.response.send_message("还没有可查看的已购写真集。", ephemeral=True)
+            return
+        await interaction.response.send_message("请选择已购商品。", view=PurchasedProductsView(self.bot, interaction.user.id, rows), ephemeral=True)
+
+    @discord.ui.button(
+        label="我的订单",
+        style=discord.ButtonStyle.secondary,
+        custom_id="profile:me:orders",
+    )
+    async def my_orders(self, interaction: discord.Interaction, button: discord.ui.Button):
+        rows = list_user_orders(interaction.user.id, limit=20)
+        if not rows:
+            await interaction.response.send_message("暂无商品订单。", ephemeral=True)
+            return
+        lines = ["最近 20 条订单："]
+        for row in rows:
+            lines.append(
+                f"`{row['request_id']}` / {row['product_name'] or row['product_id']} / "
+                f"{row['status']} / {row['requested_at'] or '-'} / {row['approved_at'] or '-'}"
+            )
+        await interaction.response.send_message("\n".join(lines), ephemeral=True)
+
+    @discord.ui.button(
+        label="联系客服",
+        style=discord.ButtonStyle.secondary,
+        custom_id="profile:me:support",
+    )
+    async def support(self, interaction: discord.Interaction, button: discord.ui.Button):
+        channel_id = int(self.bot.kcfg.get("purchase_support_channel_id", 0) or 0)
+        target = f"<#{channel_id}>" if channel_id else "管理员"
+        await interaction.response.send_message(f"购买或下载遇到问题时，请联系 {target}。", ephemeral=True)
+
+
+class PurchasedProductSelect(discord.ui.Select):
+    def __init__(self, bot: commands.Bot, target_user_id: int, rows):
+        self.bot = bot
+        self.target_user_id = int(target_user_id)
+        options = [
+            discord.SelectOption(
+                label=row["product_name"][:100],
+                value=row["product_id"],
+                description=f"首次购买：{row['first_purchased_at']} / 订单数：{row['order_count']}"[:100],
+            )
+            for row in rows[:25]
+        ]
+        super().__init__(placeholder="选择写真集", min_values=1, max_values=1, options=options)
+
+    async def callback(self, interaction: discord.Interaction):
+        if interaction.user.id != self.target_user_id:
+            await interaction.response.send_message("这不是你的写真集列表。", ephemeral=True)
+            return
+        row = get_latest_sent_order_for_product(interaction.user.id, self.values[0])
+        if row is None:
+            await interaction.response.send_message("未找到可查看的购买记录。", ephemeral=True)
+            return
+        embed = discord.Embed(title=row["product_name"])
+        embed.add_field(name="下载链接", value=row["download_url"], inline=False)
+        embed.add_field(name="解压密码", value=row["download_password"] or "无", inline=False)
+        embed.add_field(name="文件大小", value=row["file_size_label"] or "未设置", inline=True)
+        embed.add_field(name="最近更新", value=row["product_updated_at"] or "-", inline=True)
+        await interaction.response.send_message(embed=embed, view=PurchasedProductActionsView(self.bot, interaction.user.id, row["request_id"]), ephemeral=True)
+
+
+class PurchasedProductsView(discord.ui.View):
+    def __init__(self, bot: commands.Bot, target_user_id: int, rows):
+        super().__init__(timeout=300)
+        self.add_item(PurchasedProductSelect(bot, target_user_id, rows))
+
+
+class PurchasedProductActionsView(discord.ui.View):
+    def __init__(self, bot: commands.Bot, target_user_id: int, order_id: str):
+        super().__init__(timeout=300)
+        self.bot = bot
+        self.target_user_id = int(target_user_id)
+        self.order_id = order_id
+
+    @discord.ui.button(label="重新发送到邮箱", style=discord.ButtonStyle.primary)
+    async def resend(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if interaction.user.id != self.target_user_id:
+            await interaction.response.send_message("这不是你的交付操作。", ephemeral=True)
+            return
+        order = get_order(self.order_id)
+        if order is None or order["user_id"] != str(interaction.user.id) or order["status"] not in {"SENT", "DELIVERY_FAILED"}:
+            await interaction.response.send_message("该订单当前不能自助重发。", ephemeral=True)
+            return
+        deliveries = list_order_deliveries(self.order_id)
+        max_retry = int(self.bot.kcfg.get("max_retry_count", 3))
+        if len(deliveries) >= max_retry:
+            await interaction.response.send_message("已达到自助重发次数上限，请联系客服。", ephemeral=True)
+            return
+        cooldown = int(self.bot.kcfg.get("self_service_cooldown_minutes", 60))
+        if deliveries:
+            latest = deliveries[0]["attempted_at"]
+            try:
+                latest_dt = discord.utils.parse_time(latest)
+                now_dt = discord.utils.utcnow()
+                if latest_dt and (now_dt - latest_dt).total_seconds() < cooldown * 60:
+                    await interaction.response.send_message("重发冷却中，请稍后再试。", ephemeral=True)
+                    return
+            except Exception:
+                pass
+        await interaction.response.defer(ephemeral=True)
+        ok = await deliver_product_order(order, bot=self.bot)
+        await interaction.followup.send("已重新发送到邮箱。" if ok else "发送失败，请联系客服。", ephemeral=True)

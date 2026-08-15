@@ -32,6 +32,7 @@
 - 付款申请及管理员按钮审核
 - 自动授予付费会员角色
 - 会员开始时间、到期时间及状态记录
+- P0 商品商店、PayPay 商品订单、邮件交付和“我的写真集”
 - 即将到期提醒
 - 新成员欢迎消息和个人资料收集
 - SQLite 配置中心 `Kvs_M`
@@ -87,6 +88,12 @@ python main.py
 | `DISCORD_TOKEN` | 是 | `PUT_YOUR_TOKEN_HERE` | Discord Bot Token |
 | `KVS_ADMIN_KEY` | 是 | 空 | 通过 DM 修改机器人配置时使用的密码 |
 | `DB_PATH` | 否 | `bot.db` | SQLite 数据库路径 |
+| `MAIL_MODE` | 否 | `log` | `log` 为模拟发送，`smtp` 为真实邮件发送 |
+| `SMTP_HOST` / `SMTP_PORT` | 否 | 空 / `587` | SMTP 服务器 |
+| `SMTP_USERNAME` / `SMTP_PASSWORD` | 否 | 空 | SMTP 登录信息 |
+| `SMTP_USE_TLS` | 否 | `true` | 是否启用 STARTTLS |
+| `MAIL_FROM_ADDRESS` / `MAIL_FROM_NAME` | 否 | 空 / `Kiri Club` | 发件邮箱与显示名 |
+| `APP_ENV` / `LOG_LEVEL` | 否 | `development` / `INFO` | 运行环境和日志等级 |
 
 #### 2. 初始化运行配置
 
@@ -100,10 +107,13 @@ python main.py
 
 ```text
 !kvs 你的密码 discord channel review_id 审核频道ID
+!kvs 你的密码 discord channel shop_id 商店频道ID
 !kvs 你的密码 discord channel remind_id 到期提醒频道ID
 !kvs 你的密码 discord channel welcome_id 欢迎频道ID
 !kvs 你的密码 discord role paid_id 付费会员角色ID
+!kvs 你的密码 discord role buyer_id 商品购买者角色ID
 !kvs 你的密码 auth role admin_role_ids 管理员角色ID
+!kvs 你的密码 billing global paypay_url https://你的-paypay-链接
 !kvs 你的密码 billing global month_price_label 1000円
 !kvs 你的密码 reminder global expiry_days 5
 !kvs 你的密码 reminder global scan_hours 12
@@ -154,11 +164,51 @@ python main.py
 4. 通过后，Bot 授予 `paid_id` 对应的角色，并私信成员。
 5. 当前会员期限规则为：从审核通过时开始，到下一个月的最后一天 `23:59:59`（JST）结束。
 
-#### 5. 新人资料
+#### 5. P0 商品商店
+
+管理员可以使用现有 `!` 命令管理商品：
+
+```text
+!product_create KIRI-2026-08 2000 https://example.com/download KIRI 2026年8月写真集
+!product_edit KIRI-2026-08 description 8月写真集说明
+!product_edit KIRI-2026-08 download_password password-text
+!product_publish KIRI-2026-08
+!shoppanel
+!order_resend 订单ID
+```
+
+用户在商店面板选择商品后，会以私密回复取得 PayPay 链接并提交“已付款”信息和邮箱。管理员在审核频道批准后，Bot 会尝试赋予 `buyer_id`（未设置时临时复用 `paid_id`）并执行邮件交付。`MAIL_MODE=log` 时不会真的发送邮件，但会记录模拟成功的交付记录。
+
+用户可在 `!profilepanel` 发布的 Profile 面板中查看“我的写真集”和“我的订单”。停止销售的商品不会再出现在商店，但已购用户仍可查看下载信息。
+
+启动时 Bot 会输出 P0 自检摘要；如果配置了 `discord/channel/bot_log_id`，也会把运营级摘要发送到日志频道。邮件失败时订单保留为 `DELIVERY_FAILED`，用户可在 Profile 面板按冷却时间自助重发，管理员也可用 `!order_resend <订单ID>` 强制重试。
+
+#### 6. 社区与长期运营功能
+
+式样书中的动态、投票、提问箱、活动、支持者等级和粉丝投稿已实现为 Discord `!` 命令：
+
+```text
+!feed_post <title> [original_url] <body>
+!poll_create <PUBLIC|BUYER> <title> <option1|option2>
+!poll_vote <poll_id> <option_index>
+!poll_close <poll_id>
+!question <anonymous|no> <body>
+!question_answer <question_id> <answer>
+!event_create <starts_at> <no|buyer> <title> [description]
+!event_join <event_id>
+!supporter_set @member <level_name> [benefits]
+!submission_add <title> [url] [note]
+!submission_pick <submission_id> <YYYYMM>
+!export_products_json public-products.json
+```
+
+Buyer 限定投票和活动使用 `buyer_id`，未设置时 fallback 到 `paid_id`。`!export_products_json` 只导出公开商品字段，不包含下载链接、密码、用户、订单或付款信息。
+
+#### 7. 新人资料
 
 新成员加入服务器时，Bot 会在 `welcome_id` 对应频道发送欢迎消息和资料填写按钮。如果没有设置该 ID，则尝试使用服务器的系统频道。
 
-#### 6. 自动创建付费区
+#### 8. 自动创建付费区
 
 完整模式每次启动时会为当前年份检查并创建：
 
