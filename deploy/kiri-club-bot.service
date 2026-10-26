@@ -1,0 +1,18 @@
+[Unit]
+Description=Kiri Club Discord membership and announcements
+After=network-online.target kiri-club-admin.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=%h/WorkSpace/kiri-bot
+EnvironmentFile=%h/.config/kiri-club/admin.env
+EnvironmentFile=%h/.config/kiri-club/bot.env
+ExecStart=%h/WorkSpace/kiri-bot/.venv/bin/python club_bot.py
+Restart=on-failure
+RestartSec=15
+UMask=0077
+NoNewPrivileges=true
+
+[Install]
+WantedBy=default.target

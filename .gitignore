@@ -1,1 +1,10 @@
 run.ps1
+# Club runtime data
+club-media/
+*.db
+*.db-*
+__pycache__/
+.venv/
+.env
+
+.local-data/

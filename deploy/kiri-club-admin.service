@@ -1,0 +1,16 @@
+[Unit]
+Description=Kiri Club local admin and public catalog
+After=network.target
+
+[Service]
+Type=simple
+WorkingDirectory=%h/WorkSpace/kiri-bot
+EnvironmentFile=%h/.config/kiri-club/admin.env
+ExecStart=%h/WorkSpace/kiri-bot/.venv/bin/python club_admin.py
+Restart=on-failure
+RestartSec=5
+UMask=0077
+NoNewPrivileges=true
+
+[Install]
+WantedBy=default.target

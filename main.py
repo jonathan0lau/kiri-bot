@@ -536,6 +536,11 @@ async def ensure_shop_panel_message(channel: discord.TextChannel, report: list[s
 async def on_ready():
     init_db()
     reload_kcfg()
+    if os.getenv("CLUB_ENABLED", "0") == "1":
+        import club_store
+        club_store.init()
+        if not club_tick.is_running():
+            club_tick.start()
 
     bot.add_view(PayPanelView(bot))
     bot.add_view(ProfilePanelView(bot))
@@ -1282,6 +1287,15 @@ async def expiring_reminder_tick():
 
     bot._next_remind_at = now + timedelta(hours=scan_hours)
 
+
+
+@tasks.loop(seconds=30)
+async def club_tick():
+    import club_worker
+    try:
+        await club_worker.tick(bot)
+    except Exception:
+        logger.exception("Club P0 worker failed; will retry on next tick")
 
 
 @bot.event
